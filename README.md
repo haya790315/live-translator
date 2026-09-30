@@ -41,9 +41,9 @@ floating live subtitles
 - 目標平台：Apple Silicon（目前開發／測試機為 M1、16 GB unified memory）
 - 音訊來源：macOS system audio，不以麥克風為主要輸入
 - 音訊擷取：ScreenCaptureKit
-- STT 目前採用：NVIDIA parakeet-tdt_ctc-0.6b-ja（MLX 移植，parakeet-mlx）
+- STT 採用 NVIDIA parakeet-tdt_ctc-0.6b-ja（MLX 移植，parakeet-mlx）
   - 先前為 Whisper large-v3-turbo；日文評測中 Parakeet 在 JSUT／Common Voice 更準且快數十倍
-  - 準確度備選：Qwen3-ASR-1.7B
+  - 選用、預設關閉：句子定稿後交給 Qwen3-ASR-1.7B 8-bit（mlx-audio）重新辨識該句音訊。它帶語言模型解碼器，能把含糊發音校正成通順的字並自動判定日／英，但每句多 1～2 秒、多佔 2.5 GB 記憶體，16 GB 機器上容易 swap。要開啟：`uv pip install --python .venv/bin/python "mlx-audio[stt]"`，把 `mlx-community/Qwen3-ASR-1.7B-8bit` 下載到 `Models/Qwen3-ASR-1.7B-8bit`，再在 `Models/final-model.txt` 寫入 `Qwen3-ASR-1.7B-8bit` 後重開 App
 - 翻譯目前採用：Hy-MT2-1.8B 8-bit（騰訊第二代翻譯模型，Apache-2.0，支援指令式上下文）
   - 先前為 Qwen3-4B 4-bit 與 Hunyuan-MT-7B 4-bit；備選 Hy-MT2-7B、Qwen3.5-9B、TranslateGemma
 - 低延遲 baseline：NLLB-200 distilled 600M
@@ -64,25 +64,36 @@ floating live subtitles
 | System audio capture | ScreenCaptureKit | 原生 Swift/macOS app |
 | Audio preprocessing | 16 kHz mono PCM + Silero VAD | ScreenCaptureKit 直接輸出 16 kHz 單聲道；VAD 以 onnxruntime 在 CPU 跑，每 32 ms 一幀 |
 | Streaming STT | parakeet-tdt_ctc-0.6b-ja 加 parakeet-tdt-0.6b-v3 | 兩個模型每次都解碼，依信心值、輸出長度與片假名比例擇一；v3 缺席時只跑日文 |
+| Final STT（選用） | Qwen3-ASR-1.7B 8-bit | 預設關閉。開啟後句子定稿時重解該句音訊；只採用與 parakeet 結果有重疊的句子，避免混入前後句；不足 2 秒的短句沿用 parakeet 判定的語言 |
 | Translation | Hy-MT2-1.8B 8-bit | 整句翻譯、帶前兩句上下文、提示前綴 KV cache 重用、greedy 解碼 |
 | Translation baseline | NLLB-200 distilled 600M | 延遲基準；授權限制見下方 |
 | Subtitle UI | AppKit floating panel | 已有可拖移原型，待真實會議驗證 |
 
-## 目錄
+## 目錄與檔案
 
 ```text
-App/          macOS 原生 app、ScreenCaptureKit 與字幕 UI
-Inference/    STT／翻譯 backend 與模型介面
-Benchmarks/   音訊樣本規格、量測工具與結果
-Docs/         架構與設計紀錄
-Scripts/      開發、下載與 benchmark 輔助腳本
-Tests/        自動化測試
-Models/       本地模型目錄（內容不進 Git）
+App/LiveTranslator.swift          macOS 原生 App：ScreenCaptureKit 擷取系統音訊、浮動字幕視窗、啟動 Python worker、儲存逐字稿
+App/Info.plist                    App 設定與螢幕錄製權限說明
+App/AppIcon.icns                  App 圖示
+Inference/worker.py               推論 worker：VAD、parakeet 辨識、Hy-MT2 翻譯（選用的 Qwen3-ASR 定稿重解）；以 JSON 行與 App 溝通
+Scripts/setup.sh                  一鍵安裝：建 venv、裝套件、下載模型、訓練斷句分類器、編譯 App
+Scripts/download_models.py        從 Hugging Face 下載模型到 Models/
+Scripts/make_segment_data.py      下載 BSD 語料並合成「句子講完／沒講完」訓練資料
+Scripts/train_segmenter.py        訓練字尾 n-gram 斷句分類器，輸出 Models/segmenter/weights.json
+Scripts/build.sh                  編譯並簽章 Build/LiveTranslator.app（改了程式後重跑）
+Scripts/make_signing_identity.sh  選用：建立本機自簽憑證，重編後不必重新授權
+Docs/V1_PLAN.md                   設計紀錄、量測結果與已知風險
+PREREQUISITES.md                  環境、權限與模型授權的前置說明
+mise.toml                         指定 Python 3.12
+Models/                           本地模型與訓練產物（內容不進 Git）
+Build/、Transcripts/、Logs/        編譯產物、逐字稿、執行紀錄（皆不進 Git）
 ```
+
+所有推論都在本機完成。網路只用於安裝時下載套件與模型（Hugging Face 與 GitHub 上的 BSD 語料）；執行時 worker 強制離線模式。
 
 ## 開始之前
 
-請先閱讀 [PREREQUISITES.md](PREREQUISITES.md)。準備一段已獲授權的 30～60 秒日文會議音訊，配合人工校對原文與譯文驗收。`Scripts/setup.sh` 只下載目前原型使用的兩個模型，不下載整個候選矩陣。
+請先閱讀 [PREREQUISITES.md](PREREQUISITES.md)。準備一段已獲授權的 30～60 秒日文會議音訊，配合人工校對原文與譯文驗收。`Scripts/setup.sh` 只下載目前使用的模型，不下載整個候選矩陣。
 
 ## 成功指標（初始目標）
 
@@ -97,6 +108,7 @@ Models/       本地模型目錄（內容不進 Git）
 ## 授權提醒
 
 - parakeet-tdt_ctc-0.6b-ja 與 parakeet-tdt-0.6b-v3 權重標示為 CC-BY-4.0；Silero VAD 為 MIT。
+- Qwen3-ASR-1.7B（選用）權重標示為 Apache-2.0，MLX 8-bit 版由 mlx-community 轉換。
 - 斷句分類器的訓練資料合成自 BSD（Business Scene Dialogue）語料，該語料為 CC BY-NC-SA 4.0，只適合私人、非商用；`Models/segment-data/` 內同時有 Laya 微調格式的 JSONL。
 - Hy-MT2-1.8B 權重標示為 Apache-2.0，MLX 8-bit 版由 mlx-community 轉換。
 - Hunyuan-MT-7B（備選）採騰訊 Hunyuan 社群授權，商用有條件限制；MLX 4-bit 版由第三方（shawizir）轉換。

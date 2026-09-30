@@ -38,8 +38,6 @@ Logs/
 *.mp3
 *.m4a
 *.flac
-Benchmarks/results/*
-!Benchmarks/results/.gitkeep
 
 # Local configuration and logs
 .env

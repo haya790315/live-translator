@@ -13,6 +13,6 @@
     <key>CFBundleVersion</key><string>1</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
-    <key>NSScreenCaptureUsageDescription</key><string>擷取 Mac 系統音訊，產生日文與繁體中文字幕。音訊只在本機處理，不會保存或上傳。</string>
+    <key>NSScreenCaptureUsageDescription</key><string>擷取 Mac 系統音訊，產生日文、英文與中文字幕。音訊只在本機處理，不會保存或上傳。</string>
 </dict>
 </plist>

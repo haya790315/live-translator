@@ -1,3 +1,4 @@
+import difflib
 import json
 import os
 import re
@@ -46,10 +47,17 @@ CONTINUATION_SILENCE_BYTES = int(BYTES_PER_SECOND * CONTINUATION_SILENCE_SECONDS
 CONTEXT_UTTERANCES = 2
 SETTLE_SECONDS = 0.8
 CUT_MARGIN_SECONDS = 0.2
+REFINE_MARGIN_SECONDS = 0.1
+REFINE_MATCH = 0.5
 MIN_FORCED_CUT_SECONDS = 4.0
 PAUSE_HOLD_SECONDS = 0.35
 PARTIAL_INTERVAL = 0.4
+PARTIAL_INTERVAL_BUSY = 1.5
 MAX_TRANSLATION_TOKENS = 160
+MAX_REFINE_TOKENS = 200
+REFINER_LANGUAGES = {"Japanese": "ja", "English": "en"}
+REFINER_NAMES = {"ja": "Japanese", "en": "English"}
+REFINER_AUTO_SECONDS = 2.0
 REPETITION_PENALTY = 1.05
 MEMORY_LIMIT = 300
 SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?])|(?<=です|ます)(?![がのねよかしけでとらっ。！？!?、])|(?<=ません|でした|ました)(?![がのねよかしけでとらっ。！？!?、])")
@@ -74,6 +82,8 @@ HALLUCINATIONS = {"ご視聴ありがとうございました", "ご視聴あり
 FILLERS = {"えっと", "えーと", "ええと", "えー", "え", "あー", "あ", "あの", "あのー", "うーん", "うん", "ん", "んー", "んん", "ピッ", "はあ", "ふー", "まあ", "um", "uh", "uhm", "umm", "hmm", "hm", "mm", "mhm", "er", "ah", "oh", "huh"}
 FILLER_SPLIT = re.compile(r"[、。！？!?…ー\s.,]+")
 NORMALIZE = re.compile(r"[\s。、！？!?…]")
+MATCH_STRIP = re.compile(r"[\s。、，,.！？!?…「」『』\"'’]")
+REFINE_SPLIT = {"ja": re.compile(r"(?<=[。！？!?])"), "en": re.compile(r"(?<=[.?!])\s+")}
 CJK_SPACE = re.compile(r"(?<=[^\x00-\x7f])[ \u3000]+(?=[^\x00-\x7f])|^[ \u3000]+|[ \u3000]+$")
 
 HUNYUAN_PREFIX = "<|startoftext|>把下面的文本翻译成简体中文，不要额外解释。\n\n"
@@ -411,12 +421,53 @@ def transcribe(audio, models, voiced, preferred=None):
     return text, best["segments"], best["language"]
 
 
+class Refiner:
+    def __init__(self, path):
+        from mlx_audio.stt.utils import load as load_stt
+        self.model = load_stt(path)
+        self.model.generate(np.zeros(SAMPLE_RATE, dtype=np.float32), max_tokens=8)
+
+    def transcribe(self, audio, language):
+        samples = np.frombuffer(audio, dtype="<f4").copy()
+        hint = REFINER_NAMES.get(language) if len(samples) < SAMPLE_RATE * REFINER_AUTO_SECONDS else None
+        with gpu_lock:
+            output = self.model.generate(samples, max_tokens=MAX_REFINE_TOKENS, language=hint)
+        names = output.language if isinstance(output.language, list) else [output.language]
+        language = REFINER_LANGUAGES.get(names[0] if names else "")
+        text = output.text.strip()
+        if language == "ja":
+            text = CJK_SPACE.sub("", text)
+        return text, language
+
+
+def overlap(sentence, original):
+    a = MATCH_STRIP.sub("", sentence).lower()
+    b = MATCH_STRIP.sub("", original).lower()
+    if not a or not b:
+        return 0.0
+    matched = sum(block.size for block in difflib.SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks() if block.size >= 2)
+    return matched / len(a)
+
+
+def choose_final(original, refined, language):
+    if not refined or language is None:
+        return original
+    if NORMALIZE.sub("", refined) in HALLUCINATIONS or is_filler(refined):
+        return original
+    sentences = [piece.strip() for piece in REFINE_SPLIT[language].split(refined) if piece.strip()]
+    kept = [index for index, sentence in enumerate(sentences) if overlap(sentence, original) >= REFINE_MATCH]
+    if not kept:
+        return refined
+    return (" " if language == "en" else "").join(sentences[kept[0]: kept[-1] + 1])
+
+
 class Translator:
-    def __init__(self, model, tokenizer, model_type=""):
+    def __init__(self, model, tokenizer, model_type="", refiner=None, name=""):
+        self.refiner = refiner
         self.model = model
         self.tokenizer = tokenizer
         template = getattr(tokenizer, "chat_template", None) or ""
-        if "hy_User" in template:
+        if "hy_User" in template or "hy-mt2" in name.lower():
             self.style = "hy_mt2"
         elif model_type.startswith("hunyuan"):
             self.style = "hunyuan_mt"
@@ -486,9 +537,9 @@ class Translator:
     def _pieces(self, japanese):
         return [piece.strip() for piece in SENTENCE_SPLIT.split(japanese) if piece.strip()]
 
-    def submit(self, utterance, japanese):
+    def submit(self, utterance, japanese, audio=b"", language="ja"):
         with self.lock:
-            self.jobs.append((utterance, japanese))
+            self.jobs.append((utterance, japanese, audio, language))
             self.wake.notify()
 
     def pending(self):
@@ -545,8 +596,20 @@ class Translator:
                     self.wake.wait()
                 if not self.jobs:
                     return
-                utterance, japanese = self.jobs.pop(0)
+                utterance, japanese, audio, language = self.jobs.pop(0)
                 self.active = True
+            if self.refiner is not None and audio:
+                started = time.monotonic()
+                try:
+                    refined, detected = self.refiner.transcribe(audio, language)
+                except Exception as exc:
+                    debug(f"refine failed: {exc}")
+                    refined, detected = "", None
+                chosen = choose_final(japanese, refined, detected)
+                debug(f"refine utterance={utterance} {time.monotonic() - started:.2f}s audio={len(audio) / BYTES_PER_SECOND:.2f}s lang={language}->{detected} {japanese!r} -> {refined!r}{'' if chosen == refined else ' (kept original)'}")
+                if chosen != japanese:
+                    emit("revised_japanese", utterance, chosen)
+                    japanese = chosen
             chinese = []
             if self.context_aware:
                 try:
@@ -595,7 +658,20 @@ def main():
     emit("status", message="準備中")
     with open(os.path.join(translation_path, "config.json")) as handle:
         model_type = json.load(handle).get("model_type", "")
-    translator = Translator(*load(translation_path), model_type=model_type)
+    refiner_name = os.environ.get("LIVE_TRANSLATOR_FINAL_MODEL")
+    if refiner_name is None:
+        try:
+            with open(os.path.join(models_dir, "final-model.txt")) as handle:
+                refiner_name = handle.read().strip()
+        except OSError:
+            refiner_name = ""
+    refiner_path = refiner_name if os.path.isabs(refiner_name) else os.path.join(models_dir, refiner_name)
+    refiner = None
+    if refiner_name and refiner_name != "none" and os.path.isdir(refiner_path):
+        emit("status", message="準備中")
+        refiner = Refiner(refiner_path)
+    debug(f"refiner: {refiner_path if refiner else None}")
+    translator = Translator(*load(translation_path), model_type=model_type, refiner=refiner, name=os.path.basename(os.path.normpath(translation_path)))
     debug(f"translator style={translator.style} prefix_cached={translator.prefix_tokens is not None}")
     emit("ready", message="就緒")
 
@@ -637,7 +713,8 @@ def main():
         elif len(snap.audio) >= MAX_UTTERANCE_BYTES:
             reason, upto = "max", snap.total_bytes
         else:
-            if translator.pending() or pause >= PAUSE_HOLD_SECONDS or snap.total_bytes - decoded_until < MIN_NEW_BYTES or now - last_partial_time < PARTIAL_INTERVAL or len(snap.audio) < MIN_PARTIAL_BYTES:
+            interval = PARTIAL_INTERVAL_BUSY if translator.pending() else PARTIAL_INTERVAL
+            if pause >= PAUSE_HOLD_SECONDS or snap.total_bytes - decoded_until < MIN_NEW_BYTES or now - last_partial_time < interval or len(snap.audio) < MIN_PARTIAL_BYTES:
                 continue
             reason, upto = "partial", snap.total_bytes
 
@@ -689,18 +766,22 @@ def main():
             if finalize_all:
                 final_text = text or previous_partial
                 cut_byte = upto
+                refine_byte = upto
                 remainder = []
             else:
                 final_text = join_segments(segments[:cut_count], language)
                 cut_time = segments[cut_count - 1][1] + CUT_MARGIN_SECONDS
+                refine_time = segments[cut_count - 1][1] + REFINE_MARGIN_SECONDS
                 if cut_count < len(segments):
                     cut_time = min(cut_time, segments[cut_count][0])
-                cut_byte = snap.start_byte + int(cut_time * BYTES_PER_SECOND)
+                    refine_time = min(refine_time, segments[cut_count][0])
+                cut_byte = snap.start_byte + int(round(cut_time * SAMPLE_RATE)) * 4
+                refine_byte = snap.start_byte + int(round(refine_time * SAMPLE_RATE)) * 4
                 remainder = segments[cut_count:]
             debug(f"finalize utterance={utterance} all={finalize_all} cut={(cut_byte - snap.start_byte) / BYTES_PER_SECOND:.2f}s text={final_text!r}")
             if final_text:
                 emit("final_japanese", utterance, final_text)
-                translator.submit(utterance, final_text)
+                translator.submit(utterance, final_text, snap.audio[: refine_byte - snap.start_byte], language)
                 last_final = final_text
             utterance += 1
             state.finish(cut_byte)

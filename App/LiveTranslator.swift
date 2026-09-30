@@ -195,7 +195,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 struct WorkerEvent: Decodable {
     let kind: String
     let utterance: Int
-    let japanese: String
+    var japanese: String
     let chinese: String
     let message: String
     let stable: String?
@@ -239,7 +239,7 @@ enum PanelState {
 struct TranscriptEntry {
     let utterance: Int
     let time: String
-    let japanese: String
+    var japanese: String
     var chinese: String?
 }
 
@@ -310,77 +310,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         makePanel()
         NSApp.activate(ignoringOtherApps: true)
         start(fresh: true)
-        scheduleScriptedActions()
-    }
-
-    private func postedClick(on view: NSView) {
-        let center = view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
-        let time = ProcessInfo.processInfo.systemUptime
-        if let down = NSEvent.mouseEvent(with: .leftMouseDown, location: center, modifierFlags: [], timestamp: time, windowNumber: panel.windowNumber, context: nil, eventNumber: 1, clickCount: 1, pressure: 1) {
-            NSApp.postEvent(down, atStart: false)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            if let up = NSEvent.mouseEvent(with: .leftMouseUp, location: center, modifierFlags: [], timestamp: time + 0.15, windowNumber: self.panel.windowNumber, context: nil, eventNumber: 2, clickCount: 1, pressure: 0) {
-                NSApp.postEvent(up, atStart: false)
-            }
-        }
-    }
-
-    private func syntheticClick(on view: NSView) {
-        let center = view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
-        let time = ProcessInfo.processInfo.systemUptime
-        for (type, count) in [(NSEvent.EventType.leftMouseDown, 1), (.leftMouseUp, 1)] {
-            if let event = NSEvent.mouseEvent(with: type, location: center, modifierFlags: [], timestamp: time, windowNumber: panel.windowNumber, context: nil, eventNumber: 0, clickCount: count, pressure: 1) {
-                panel.sendEvent(event)
-            }
-        }
-        NSLog("synthetic click; first responder = %@", String(describing: panel.firstResponder))
-    }
-
-    private func scheduleScriptedActions() {
-        guard let script = ProcessInfo.processInfo.environment["LIVE_TRANSLATOR_SCRIPT"] else { return }
-        for step in script.split(separator: ",") {
-            let parts = step.split(separator: "@")
-            guard parts.count == 2, let delay = Double(parts[1]) else { continue }
-            let action = String(parts[0])
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self else { return }
-                NSLog("scripted action: %@ (state=%@)", action, String(describing: self.state))
-                switch action {
-                case "end": self.end()
-                case "save": self.save()
-                case "toggle": self.toggle()
-                case "clickend": self.endButton.performClick(nil)
-                case "clicktoggle": self.toggleButton.performClick(nil)
-                case "clicksave": self.saveButton.performClick(nil)
-                case "esc": self.panel.cancelOperation(nil)
-                case _ where action.hasPrefix("key:"):
-                    let parts = action.dropFirst(4).split(separator: ":")
-                    guard let code = UInt16(parts[0]) else { break }
-                    var flags: NSEvent.ModifierFlags = []
-                    if parts.count > 1 && parts[1].contains("c") { flags.insert(.command) }
-                    if parts.count > 1 && parts[1].contains("s") { flags.insert(.shift) }
-                    let chars = parts.count > 2 ? String(parts[2]) : ""
-                    for (type, isDown) in [(NSEvent.EventType.keyDown, true), (.keyUp, false)] {
-                        if let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: flags, timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: self.panel.windowNumber, context: nil, characters: chars, charactersIgnoringModifiers: chars, isARepeat: false, keyCode: code) {
-                            NSApp.postEvent(event, atStart: false)
-                        }
-                        _ = isDown
-                    }
-                case "clickname": self.syntheticClick(on: self.nameField)
-                case "mouseend": self.syntheticClick(on: self.endButton)
-                case "realend": self.postedClick(on: self.endButton)
-                case "realname": self.postedClick(on: self.nameField)
-                case "realtoggle": self.postedClick(on: self.toggleButton)
-                case "mousetoggle": self.syntheticClick(on: self.toggleButton)
-                case "typename":
-                    (self.panel.firstResponder as? NSTextView)?.insertText("meeting", replacementRange: NSRange(location: NSNotFound, length: 0))
-                case "enter": (self.panel.firstResponder as? NSTextView)?.insertNewline(nil)
-                case "quit": NSApp.terminate(nil)
-                default: break
-                }
-            }
-        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -1019,8 +948,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 }
                 renderTranscript()
                 refreshSavedFile()
+            case "revised_japanese":
+                if let index = entries.lastIndex(where: { $0.utterance == event.utterance }) {
+                    entries[index].japanese = event.japanese
+                    renderTranscript()
+                    refreshSavedFile()
+                }
             case "final":
                 if let index = entries.lastIndex(where: { $0.utterance == event.utterance }) {
+                    entries[index].japanese = event.japanese
                     entries[index].chinese = event.chinese
                 } else {
                     entries.append(TranscriptEntry(utterance: event.utterance, time: clock.string(from: Date()), japanese: event.japanese, chinese: event.chinese))
