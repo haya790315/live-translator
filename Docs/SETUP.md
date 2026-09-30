@@ -6,9 +6,9 @@
 
 | 項目 | 要求 |
 |---|---|
-| 硬體 | Apple Silicon Mac；記憶體 16 GB 以上（模型權重常駐約 4.3 GB，其餘給系統與其他程式） |
-| macOS | 14 以上（`Info.plist` 的 `LSMinimumSystemVersion` 與 `build.sh` 的編譯目標都是 14.0） |
-| 磁碟 | 至少 10 GB（模型 6.4 GB、Python 環境 1.3 GB） |
+| 硬體 | Apple Silicon Mac；記憶體 16 GB 以上（翻譯模型常駐約 2.3 GB） |
+| macOS | 26 以上用 SpeechAnalyzer 辨識。14 到 25 也能執行，改用 parakeet 辨識（`Info.plist` 的 `LSMinimumSystemVersion` 是 14.0） |
+| 磁碟 | 至少 5 GB（翻譯模型 1.8 GB、Python 環境 1.3 GB）；parakeet 模式再加 4.6 GB |
 | 網路 | 只在安裝時需要；執行時 worker 強制離線 |
 
 需要四個工具：
@@ -70,7 +70,7 @@ zsh Scripts/setup.sh
 安裝完成。打開 Build/LiveTranslator.app 即可開始。
 ```
 
-所需時間主要在下載 6.4 GB 模型；每秒 2.5 MB 的連線約 45 分鐘。
+所需時間主要在下載模型：macOS 26 約 1.8 GB，每秒 2.5 MB 的連線約 12 分鐘；parakeet 模式約 6.4 GB、45 分鐘。
 
 ## 3. 建立 Python 環境
 
@@ -97,14 +97,16 @@ arm64 0.32.3
 
 ## 4. 下載模型
 
-執行時用到四個模型，全部放在 `Models/` 下，目錄名固定，App 依目錄名尋找。
+模型放在 `Models/` 下，目錄名固定，App 依目錄名尋找。辨識在 macOS 26 上由系統內建的 SpeechAnalyzer 負責，不需要下載模型；腳本在 macOS 26 以上只下載翻譯模型與 VAD，14 到 25 另外下載兩個 parakeet。
 
-| 目錄（`Models/` 下） | 用途 | 大小 | 來源 | 授權 |
-|---|---|---:|---|---|
-| `parakeet-tdt_ctc-0.6b-ja` | 日文辨識 | 2.3 GB | mlx-community/parakeet-tdt_ctc-0.6b-ja | CC-BY-4.0 |
-| `parakeet-tdt-0.6b-v3` | 英文辨識；缺席時只辨識日文 | 2.3 GB | mlx-community/parakeet-tdt-0.6b-v3 | CC-BY-4.0 |
-| `Hy-MT2-1.8B-8bit` | 中文翻譯 | 1.8 GB | mlx-community/Hy-MT2-1.8B-8bit | Apache-2.0 |
-| `silero-vad/model.onnx` | 語音活動偵測 | 2 MB | onnx-community/silero-vad | MIT |
+| 目錄（`Models/` 下） | 用途 | 大小 | 何時下載 | 來源 | 授權 |
+|---|---|---:|---|---|---|
+| `Hy-MT2-1.8B-8bit` | 中文翻譯 | 1.8 GB | 一律 | mlx-community/Hy-MT2-1.8B-8bit | Apache-2.0 |
+| `silero-vad/model.onnx` | 語音活動偵測，parakeet 模式用 | 2 MB | 一律 | onnx-community/silero-vad | MIT |
+| `parakeet-tdt_ctc-0.6b-ja` | 日文辨識，parakeet 模式用 | 2.3 GB | macOS 25 以下 | mlx-community/parakeet-tdt_ctc-0.6b-ja | CC-BY-4.0 |
+| `parakeet-tdt-0.6b-v3` | 英文辨識，parakeet 模式用 | 2.3 GB | macOS 25 以下 | mlx-community/parakeet-tdt-0.6b-v3 | CC-BY-4.0 |
+
+在 macOS 26 上也想留 parakeet 當備援時，下載前設定 `LIVE_TRANSLATOR_PARAKEET=1`。
 
 ```bash
 cd "${REPO_ROOT}"
@@ -119,18 +121,16 @@ HF_HUB_DISABLE_XET=1 .venv/bin/python Scripts/download_models.py
 ls "${REPO_ROOT}"/Models/*/model.safetensors "${REPO_ROOT}/Models/silero-vad/model.onnx"
 ```
 
-**期待輸出**
+**期待輸出**（macOS 26；parakeet 模式另有兩個 `parakeet-*/model.safetensors`）
 
 ```
 .../Models/Hy-MT2-1.8B-8bit/model.safetensors
-.../Models/parakeet-tdt-0.6b-v3/model.safetensors
-.../Models/parakeet-tdt_ctc-0.6b-ja/model.safetensors
 .../Models/silero-vad/model.onnx
 ```
 
 ## 5. 訓練斷句分類器
 
-worker 用一個字尾 n-gram 分類器判斷「句子講完了沒」。權重不進 Git，安裝時在本機訓練，約 1 分鐘。
+parakeet 模式用一個字尾 n-gram 分類器判斷「句子講完了沒」，SpeechAnalyzer 模式不需要。權重不進 Git，安裝時在本機訓練，約 1 分鐘。
 
 ```bash
 cd "${REPO_ROOT}"
@@ -164,7 +164,7 @@ zsh Scripts/build.sh
 已建立 Build/LiveTranslator.app（臨時簽章；執行 zsh Scripts/make_signing_identity.sh 可固定簽章，重編後不必再授權）
 ```
 
-腳本先編到暫存目錄再換名，App 開著的時候重編也不會被殺掉。App 必須留在 `Build/` 裡，因為它從自己的位置往上兩層找 `.venv/` 與 `Models/`（[LiveTranslator.swift:740](../App/LiveTranslator.swift#L740)）。
+腳本先編到暫存目錄再換名，App 開著的時候重編也不會被殺掉。App 必須留在 `Build/` 裡，因為它從自己的位置往上兩層找 `.venv/` 與 `Models/`（[LiveTranslator.swift:756](../App/LiveTranslator.swift#L756)）。
 
 ### 選用：固定簽章身分
 
@@ -198,6 +198,8 @@ open "${REPO_ROOT}/Build/LiveTranslator.app"
 2. 沒有出現對話框或按到拒絕時：系統設定 → 隱私權與安全性 → 螢幕與系統音訊錄製 → 把「LiveTranslator」開關打開
 3. 完全結束 App（Cmd+Q）再重新開啟，權限才生效
 
+macOS 26 上第一次啟動時，SpeechAnalyzer 會向 Apple 下載日文與英文的語言資產，需要網路，下載完成前狀態停在「準備中…」。之後辨識完全離線。
+
 底部狀態列會從「準備中…」變成「聆聽中」，模型載入約 10～20 秒。之後播放任何含日文或英文的影片或會議，字幕就出現在視窗裡。
 
 ## 8. 操作與逐字稿
@@ -221,9 +223,19 @@ open "${REPO_ROOT}/Build/LiveTranslator.app"
 
 ## 9. 切換模型
 
+### 辨識引擎
+
+macOS 26 以上預設用 SpeechAnalyzer。要改回 parakeet：先依第 4 節設定 `LIVE_TRANSLATOR_PARAKEET=1` 下載 parakeet 模型，再寫入設定檔並重開 App。
+
+```bash
+echo "parakeet" > "${REPO_ROOT}/Models/speech-engine.txt"
+```
+
+改回 SpeechAnalyzer：刪掉 `Models/speech-engine.txt`。`Logs/app.log` 每次啟動會記一行 `speech engine: SpeechAnalyzer` 或 `speech engine: parakeet`。
+
 ### 翻譯模型
 
-在 `Models/translation-model.txt` 寫入 `Models/` 下的目錄名，重開 App 即生效。沒有這個檔案時依 `Hy-MT2-1.8B-8bit`、`Hunyuan-MT-7B-4bit`、`Hy-MT2-1.8B-4bit`、`Qwen3-4B-4bit` 的順序用第一個已下載的（[LiveTranslator.swift:842](../App/LiveTranslator.swift#L842)）。
+在 `Models/translation-model.txt` 寫入 `Models/` 下的目錄名，重開 App 即生效。沒有這個檔案時依 `Hy-MT2-1.8B-8bit`、`Hunyuan-MT-7B-4bit`、`Hy-MT2-1.8B-4bit`、`Qwen3-4B-4bit` 的順序用第一個已下載的（[LiveTranslator.swift:867](../App/LiveTranslator.swift#L867)）。
 
 ```bash
 echo "Hy-MT2-7B-4bit" > "${REPO_ROOT}/Models/translation-model.txt"
@@ -233,7 +245,7 @@ Hy-MT2-7B 4-bit（mlx-community/Hy-MT2-7B-4bit，4.0 GB）翻得比 1.8B 準，�
 
 ### 選用：定稿後用 Qwen3-ASR 重新辨識
 
-預設關閉。開啟後每句定稿時把該句音訊交給 Qwen3-ASR-1.7B 重解一次，能把含糊發音校正成通順的字，代價是每句多 1～2 秒、權重多 2.5 GB，16 GB 機器容易 swap。
+只在 parakeet 模式有效，預設關閉。開啟後每句定稿時把該句音訊交給 Qwen3-ASR-1.7B 重解一次，能把含糊發音校正成通順的字，代價是每句多 1～2 秒、權重多 2.5 GB，16 GB 機器容易 swap。
 
 ```bash
 cd "${REPO_ROOT}"
@@ -249,6 +261,7 @@ echo "Qwen3-ASR-1.7B-8bit" > Models/final-model.txt
 | 症狀 | 原因 | 處理 |
 |---|---|---|
 | 狀態列「尚未完成安裝」 | 找不到 `.venv/bin/python`、模型或 worker | 回到第 2 節；App 是否還在 `Build/` 裡 |
+| 狀態列「無法啟動語音辨識」 | SpeechAnalyzer 語言資產下載失敗，通常是第一次啟動時沒有網路 | 連上網路後重開 App |
 | 一直「聆聽中」但沒有字幕 | 沒有錄製權限，或重編後簽章變了、授權失效 | 第 7 節重新授權；建立固定簽章（第 6 節） |
 | 字幕延遲明顯變長、整台機器變慢 | 記憶體不足開始 swap | 關掉瀏覽器等大程式；活動監視器看「記憶體壓力」與「已使用的交換空間」 |
 | 狀態列「處理時發生錯誤」 | worker 例外 | 看 `Logs/app.log` 的最後幾行 |

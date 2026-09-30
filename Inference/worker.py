@@ -634,7 +634,34 @@ class Translator:
                 self.active = False
 
 
+def translate_only(translation_path):
+    if not os.path.isdir(translation_path):
+        emit("error", message="尚未完成安裝")
+        return 2
+    emit("status", message="準備中")
+    with open(os.path.join(translation_path, "config.json")) as handle:
+        model_type = json.load(handle).get("model_type", "")
+    translator = Translator(*load(translation_path), model_type=model_type, name=os.path.basename(os.path.normpath(translation_path)))
+    debug(f"translate-only style={translator.style}")
+    emit("ready", message="就緒")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            job = json.loads(line)
+        except ValueError:
+            continue
+        text = str(job.get("text", "")).strip()
+        if text:
+            translator.submit(int(job.get("utterance", 0)), text)
+    translator.close()
+    return 0
+
+
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--translate":
+        return translate_only(sys.argv[2])
     if len(sys.argv) not in (3, 4):
         emit("error", message="缺少本機模型路徑")
         return 2

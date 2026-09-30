@@ -243,6 +243,7 @@ struct TranscriptEntry {
     var chinese: String?
 }
 
+@MainActor
 final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTextFieldDelegate {
     private var panel: NSPanel!
     private var statusLabel: NSTextField!
@@ -277,6 +278,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var committedLength = 0
     private var liveJapanese = ""
     private var liveStable = ""
+    private var usesAnalyzer = false
+    private var engineBox: AnyObject?
+    private var utteranceBase = 0
     private let clock: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss"
@@ -324,6 +328,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     func applicationWillTerminate(_ notification: Notification) {
         NSLog("applicationWillTerminate")
         autosaveIfNeeded()
+        cancelEngine()
         sink?.close()
         if worker?.isRunning == true { worker?.terminate() }
     }
@@ -528,8 +533,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         sink = nil
         inputPipe = nil
         endingWorker = worker != nil
+        let oldEngine = engineBox
+        engineBox = nil
         Task { @MainActor in
             await oldCapture?.stop()
+            if #available(macOS 26.0, *), let engine = oldEngine as? SpeechEngine {
+                await engine.finish()
+            }
             oldSink?.close()
         }
         savedURL = nil
@@ -570,7 +580,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         running = false
         let oldCapture = capture
         capture = nil
-        Task { @MainActor in await oldCapture?.stop() }
+        let engine = engineBox
+        Task { @MainActor in
+            await oldCapture?.stop()
+            if #available(macOS 26.0, *), let engine = engine as? SpeechEngine {
+                await engine.flush()
+            }
+        }
         setState(.paused)
     }
 
@@ -822,6 +838,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         sink?.close()
         sink = nil
         if worker?.isRunning == true { worker?.terminate() }
+        cancelEngine()
         worker = nil
         inputPipe = nil
         outputPipe = nil
@@ -836,6 +853,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         setState(.preparing)
 
         let root = projectRoot()
+        let engineChoice = (try? String(contentsOf: root.appendingPathComponent("Models/speech-engine.txt"), encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if #available(macOS 26.0, *), engineChoice != "parakeet" {
+            usesAnalyzer = true
+        } else {
+            usesAnalyzer = false
+        }
+        NSLog("speech engine: %@", usesAnalyzer ? "SpeechAnalyzer" : "parakeet")
         let python = root.appendingPathComponent(".venv/bin/python")
         let script = Bundle.main.resourceURL!.appendingPathComponent("worker.py")
         let speech = root.appendingPathComponent("Models/parakeet-tdt_ctc-0.6b-ja")
@@ -848,7 +873,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             .first { FileManager.default.fileExists(atPath: $0.appendingPathComponent("model.safetensors").path) }
         guard FileManager.default.isExecutableFile(atPath: python.path),
               FileManager.default.fileExists(atPath: script.path),
-              FileManager.default.fileExists(atPath: speech.appendingPathComponent("model.safetensors").path),
+              usesAnalyzer || FileManager.default.fileExists(atPath: speech.appendingPathComponent("model.safetensors").path),
               let translation else {
             starting = false
             setState(.problem("尚未完成安裝", "請先在專案目錄執行 Scripts/setup.sh"))
@@ -858,8 +883,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let process = Process()
         process.executableURL = python
         let english = root.appendingPathComponent("Models/parakeet-tdt-0.6b-v3")
-        var arguments = [script.path, speech.path, translation.path]
-        if FileManager.default.fileExists(atPath: english.appendingPathComponent("model.safetensors").path) {
+        var arguments = usesAnalyzer ? [script.path, "--translate", translation.path] : [script.path, speech.path, translation.path]
+        if !usesAnalyzer && FileManager.default.fileExists(atPath: english.appendingPathComponent("model.safetensors").path) {
             arguments.append(english.path)
         }
         process.arguments = arguments
@@ -931,7 +956,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             case "status":
                 break
             case "ready":
-                beginCapture()
+                if usesAnalyzer, #available(macOS 26.0, *) {
+                    prepareAnalyzer()
+                } else {
+                    beginCapture()
+                }
             case "partial_japanese":
                 guard event.utterance >= currentUtterance else { break }
                 currentUtterance = event.utterance
@@ -950,12 +979,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 refreshSavedFile()
             case "revised_japanese":
                 if let index = entries.lastIndex(where: { $0.utterance == event.utterance }) {
+                    invalidateRendering(from: index)
                     entries[index].japanese = event.japanese
                     renderTranscript()
                     refreshSavedFile()
                 }
             case "final":
                 if let index = entries.lastIndex(where: { $0.utterance == event.utterance }) {
+                    invalidateRendering(from: index)
                     entries[index].japanese = event.japanese
                     entries[index].chinese = event.chinese
                 } else {
@@ -972,11 +1003,85 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
+    private func invalidateRendering(from index: Int) {
+        if index < committedCount {
+            committedCount = 0
+            committedLength = 0
+        }
+    }
+
+    private func cancelEngine() {
+        if #available(macOS 26.0, *), let engine = engineBox as? SpeechEngine {
+            engine.cancel()
+        }
+        engineBox = nil
+    }
+
+    @available(macOS 26.0, *)
+    private func prepareAnalyzer() {
+        guard starting, let sink else { return }
+        let engine = SpeechEngine()
+        engineBox = engine
+        utteranceBase = entries.map(\.utterance).max() ?? 0
+        engine.onPartial = { [weak self] text in self?.analyzerPartial(text) }
+        engine.onFinal = { [weak self] id, text, _ in self?.analyzerFinal(id: id, text: text, sink: sink) }
+        engine.onRevise = { [weak self] id, text in self?.analyzerRevise(id: id, text: text, sink: sink) }
+        engine.onError = { [weak self] message in
+            NSLog("speech engine error: %@", message)
+            self?.setState(.problem("語音辨識發生錯誤", message))
+        }
+        Task { @MainActor in
+            do {
+                try await engine.prepare()
+                guard self.engineBox === engine else { return }
+                self.beginCapture()
+            } catch {
+                guard self.engineBox === engine else { return }
+                self.starting = false
+                self.engineBox = nil
+                self.setState(.problem("無法啟動語音辨識", error.localizedDescription))
+            }
+        }
+    }
+
+    private func analyzerPartial(_ text: String) {
+        liveStable = String(zip(liveJapanese, text).prefix { $0 == $1 }.map(\.0))
+        liveJapanese = text
+        renderTranscript()
+        if running { setState(.listening) }
+    }
+
+    private func sendForTranslation(utterance: Int, text: String, sink: AudioSink) {
+        guard let line = try? JSONSerialization.data(withJSONObject: ["utterance": utterance, "text": text]) else { return }
+        sink.write(line + Data([10]))
+    }
+
+    private func analyzerFinal(id: Int, text: String, sink: AudioSink) {
+        let utterance = utteranceBase + id
+        entries.append(TranscriptEntry(utterance: utterance, time: clock.string(from: Date()), japanese: text, chinese: nil))
+        renderTranscript()
+        refreshSavedFile()
+        sendForTranslation(utterance: utterance, text: text, sink: sink)
+    }
+
+    private func analyzerRevise(id: Int, text: String, sink: AudioSink) {
+        let utterance = utteranceBase + id
+        guard let index = entries.lastIndex(where: { $0.utterance == utterance }) else { return }
+        invalidateRendering(from: index)
+        entries[index].japanese = text
+        renderTranscript()
+        refreshSavedFile()
+        sendForTranslation(utterance: utterance, text: text, sink: sink)
+    }
+
     private func beginCapture() {
         guard starting, let sink else { return }
-        let capture = AudioCapture(onAudio: { data in
-            sink.write(data)
-        }, onError: { [weak self] message in
+        var onAudio: (Data) -> Void = { data in sink.write(data) }
+        if #available(macOS 26.0, *), usesAnalyzer, let engine = engineBox as? SpeechEngine {
+            let feeder = engine.feeder
+            onAudio = { data in feeder.append(data) }
+        }
+        let capture = AudioCapture(onAudio: onAudio, onError: { [weak self] message in
             DispatchQueue.main.async { self?.setState(.problem("系統音訊中斷", message)) }
         })
         self.capture = capture
@@ -998,9 +1103,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
 }
 
-signal(SIGPIPE, SIG_IGN)
-let app = NSApplication.shared
-let controller = AppController()
-app.delegate = controller
-app.setActivationPolicy(.regular)
-app.run()
+@main
+enum LiveTranslatorApp {
+    @MainActor static var controller: AppController?
+
+    @MainActor static func main() {
+        signal(SIGPIPE, SIG_IGN)
+        let app = NSApplication.shared
+        let controller = AppController()
+        self.controller = controller
+        app.delegate = controller
+        app.setActivationPolicy(.regular)
+        app.run()
+    }
+}
