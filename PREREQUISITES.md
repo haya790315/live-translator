@@ -1,6 +1,6 @@
 # 前置要件
 
-這份文件記錄 prototype 階段的保守基線。版本會在第一次 benchmark 後鎖定；目前不提供一鍵安裝，也不下載任何模型。
+這份文件記錄 prototype 階段的保守基線。版本會在第一次 benchmark 後鎖定。現有 `Scripts/setup.sh` 可建立原型環境並下載目前使用的兩個模型；日常推論仍須完全離線。
 
 ## 1. 硬體與作業系統
 
@@ -21,15 +21,12 @@
 
 ## 2. Apple 開發工具
 
-- Xcode 16 或更新版本
-- Xcode Command Line Tools
-- Swift（隨 Xcode 提供）
-- macOS SDK（隨 Xcode 提供）
+- Xcode Command Line Tools 與其中的 Apple Swift、macOS SDK，可用於目前的 `Scripts/build.sh`
+- 若需使用 Xcode IDE，另行安裝完整 Xcode
 
 確認方式：
 
 ```bash
-xcodebuild -version
 xcrun swift --version
 xcrun --sdk macosx --show-sdk-version
 ```
@@ -67,7 +64,7 @@ python3 -c "import platform; print(platform.machine())"
 brew install cmake ffmpeg ninja pkg-config
 ```
 
-MLX 路線預計會用到 `mlx-whisper`；Qwen 路線優先評估 `mlx-lm`。NLLB baseline 可能使用 Transformers/PyTorch、ONNX Runtime 或轉換後格式，必須先以 M1 latency 與 peak memory 決定，暫不鎖套件版本。
+目前原型使用 `parakeet-mlx`（NVIDIA Parakeet 的 MLX 移植）與 `mlx-lm`。NLLB baseline 可能使用 Transformers/PyTorch、ONNX Runtime 或轉換後格式，必須先以 M1 latency 與 peak memory 決定，暫不鎖套件版本。
 
 ## 4. macOS 權限
 
@@ -77,7 +74,7 @@ ScreenCaptureKit 不會在未授權時靜默擷取內容。第一次啟動時需
   - macOS 版本不同時，名稱可能顯示為「螢幕錄製」或相近文字
 - app target 的 `Info.plist` 需提供 `NSScreenCaptureUsageDescription`
 
-可能需要完全結束並重新開啟 app 才會套用權限。若日後加入麥克風模式，還需 `NSMicrophoneUsageDescription` 與麥克風權限；純 system audio prototype 不應要求不必要的麥克風權限。
+可能需要完全結束並重新開啟 app 才會套用權限。授權綁在 App 的簽章上：臨時簽章每次編譯都不同，所以重編後常要再授權；`Scripts/make_signing_identity.sh` 會建立一張自簽憑證讓簽章固定下來。若日後加入麥克風模式，還需 `NSMicrophoneUsageDescription` 與麥克風權限；純 system audio prototype 不應要求不必要的麥克風權限。
 
 實作時：
 

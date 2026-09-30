@@ -8,6 +8,7 @@ xcuserdata/
 
 # Swift Package Manager
 .build/
+Build/
 .swiftpm/
 Package.resolved
 
@@ -31,6 +32,8 @@ Models/*
 *.mlmodelc/
 
 # Audio, transcripts, and benchmark output
+Transcripts/
+Logs/
 *.wav
 *.mp3
 *.m4a
