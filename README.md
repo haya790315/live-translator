@@ -7,7 +7,9 @@ macOS 系統音訊（ScreenCaptureKit）
         ↓
 Apple SpeechAnalyzer 日文與英文轉錄器同時辨識，依結果挑語言（macOS 內建，本機執行）
         ↓
-Hy-MT2-1.8B 中文翻譯（MLX，帶前兩句上下文）
+（選用）術語表替換 → Qwen3-4B 潤稿：刪贅詞、補標點，只准刪不准改（MLX）
+        ↓
+Hy-MT2-1.8B 中文翻譯（MLX，帶前兩句上下文；潤稿開啟時另帶會議主題與術語表）
         ↓
 浮動字幕視窗、Transcripts/*.txt
 ```
@@ -43,7 +45,7 @@ App/LiveTranslator.swift          macOS 原生 App：ScreenCaptureKit 擷取系�
 App/SpeechEngine.swift            SpeechAnalyzer 辨識：日英兩個轉錄器、切句定稿、挑語言、正式定稿後的修正
 App/Info.plist                    App 設定與螢幕錄製權限說明
 App/AppIcon.icns                  App 圖示
-Inference/worker.py               推論 worker：Hy-MT2 翻譯；parakeet 模式下另負責 VAD 與辨識；以 JSON 行與 App 溝通
+Inference/worker.py               推論 worker：Hy-MT2 翻譯；選用的 Qwen3-4B 潤稿與會議記憶；parakeet 模式下另負責 VAD 與辨識；以 JSON 行與 App 溝通
 Scripts/setup.sh                  一鍵安裝：建 venv、裝套件、下載模型、訓練斷句分類器、編譯 App
 Scripts/download_models.py        從 Hugging Face 下載模型到 Models/
 Scripts/make_segment_data.py      下載 BSD 語料並合成「句子講完／沒講完」訓練資料
@@ -62,6 +64,6 @@ Build/、Transcripts/、Logs/        編譯產物、逐字稿、執行紀錄（�
 ## 授權
 
 - 語音辨識使用 macOS 內建的 SpeechAnalyzer，語言資產由 Apple 提供。parakeet 模式用的 parakeet-tdt_ctc-0.6b-ja 與 parakeet-tdt-0.6b-v3 權重為 CC-BY-4.0；Silero VAD 為 MIT。
-- Hy-MT2-1.8B 權重為 Apache-2.0，MLX 8-bit 版由 mlx-community 轉換。選用的 Qwen3-ASR-1.7B 同為 Apache-2.0。
+- Hy-MT2-1.8B 權重為 Apache-2.0，MLX 8-bit 版由 mlx-community 轉換。選用的 Qwen3-ASR-1.7B 與 Qwen3-4B 同為 Apache-2.0。
 - 斷句分類器的訓練資料合成自 BSD（Business Scene Dialogue）語料，該語料為 CC BY-NC-SA 4.0，因此整體只適合私人、非商用。
 - 正式發佈前須再次審查所有模型、程式庫及測試音訊的授權。

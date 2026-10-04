@@ -104,6 +104,62 @@ CHAT_SYSTEM_PROMPT = """你是实时会议字幕的日译中译者。把用户�
 日文：田中さんはこの件を担当しません。
 译文：田中不负责这件事。"""
 
+# 潤稿：定稿後、翻譯前，用通用 LLM（預設 Qwen3-4B）把辨識出的原文整理乾淨，輸出仍是原文的語言
+POLISH_CONTEXT = 3
+POLISH_MIN_CHARS = 7
+POLISH_TIMEOUT = 3.0
+MAX_POLISH_TOKENS = 120
+POLISH_MIN_LENGTH = 0.6
+POLISH_LINE = re.compile(r"润稿\s*[:：]\s*(.*)")
+LATIN_WORD = re.compile(r"[A-Za-z]+")
+PARTICLE_START = re.compile(r"^[とがをにはも](?=[^\x00-\x7f])")
+POLISH_SYSTEM_PROMPT = """你是会议逐字稿的校对员。对【本句】做最小限度的修正，输出与输入同一种语言，绝不翻译。
+只允许做这四件事：
+1. 删掉填充词（えー、あの、えっと、um、uh）和说错后重说的重复片段
+2. 【本句】开头若重复了【前文】最后一句的结尾，删掉重复的开头
+3. 依【术语表】和前后文，把语音识别听错的专有名词改成正确写法
+4. 补上标点
+禁止：改写措辞、调换语序、删除任何名词或动词、添加原文没有的内容、把疑问句改成陈述句。
+禁止改动语尾和助词：思ってます 不要改成 思っています，ので 不要改成 けど，口语保持口语。
+拿不准就原样输出。只输出一行，格式：
+润稿：<修正后的句子>
+
+示例一
+【前文】无
+【本句】えっとあのサーバーの移行はあの来週の金曜日までに完了する予定です
+润稿：サーバーの移行は来週の金曜日までに完了する予定です。
+
+示例二
+【术语表】Shopify（误听：ショッピファイ）
+【前文】次はショッピファイの件ですね。
+【本句】件ですねショピファイの決済まわりでちょっと確認したいことがあります
+润稿：Shopifyの決済まわりでちょっと確認したいことがあります。
+
+示例三
+【前文】无
+【本句】So, um, we we should probably sync with the the backend team first.
+润稿：So, we should probably sync with the backend team first."""
+
+# 會議記憶：翻譯佇列空著時，從最近幾句原始文字抽出主題與聽錯的專有名詞，供潤稿與翻譯參考
+MEMORY_EVERY = 6
+MEMORY_IDLE_SECONDS = 3.0
+MEMORY_WINDOW = 8
+MEMORY_TIMEOUT = 4.0
+MAX_MEMORY_TOKENS = 160
+GLOSSARY_LIMIT = 40
+TOPIC_LIMIT = 60
+MEMORY_TOPIC_LINE = re.compile(r"主题\s*[:：]\s*(.*)")
+MEMORY_TERMS_LINE = re.compile(r"术语\s*[:：]\s*(.*)")
+TERM_SPLIT = re.compile(r"\s*[、,，;；]\s*")
+MEMORY_SYSTEM_PROMPT = """你是会议记录助手。根据【最近的逐字稿】（语音识别的原始输出，专有名词可能听错）更新会议信息。
+输出固定两行：
+主题：<一句话概括【最近的逐字稿】正在讨论什么，不超过 40 字；话题变了就换>
+术语：<新发现的专有名词，格式 听错写法=正确写法，用、分隔；只列人名、公司名、产品名、服务名、英文缩写；只列【当前术语表】里没有的；没有写 无>
+规则：
+- 听错写法必须一字不差地出现在【最近的逐字稿】里，包括用片假名拼出来的外来名称（如 ショピファイト=Shopify）和拼错的英文（如 sopifi=Shopify）
+- 正确写法用通行的正式写法（如 Shopify、LINE、GitHub）；拿不准的不要列
+- 不要解释"""
+
 emit_lock = threading.Lock()
 gpu_lock = threading.Lock()
 
@@ -119,6 +175,12 @@ def debug(message):
     if DEBUG:
         sys.stderr.write(f"[worker {time.monotonic():.2f}] {message}\n")
         sys.stderr.flush()
+
+
+# 不受 DEBUG 控制，App 會把 stderr 接到 Logs/app.log；用來留下潤稿前後的對照
+def note(message):
+    sys.stderr.write(f"[worker] {message}\n")
+    sys.stderr.flush()
 
 
 class Judge:
@@ -461,9 +523,199 @@ def choose_final(original, refined, language):
     return (" " if language == "en" else "").join(sentences[kept[0]: kept[-1] + 1])
 
 
+class Glossary:
+    """聽錯寫法 → 正確寫法。只收錄能在原始文字裡找到的對照，套用時不經過模型。"""
+
+    def __init__(self):
+        self.entries = {}
+
+    def add(self, wrong, right, evidence):
+        wrong, right = wrong.strip().strip("「」『』\"'"), right.strip().strip("「」『』\"'")
+        if len(wrong) < 2 or not right or len(right) > 30 or "=" in right or wrong == right:
+            return False
+        if wrong.lower() not in evidence.lower() or wrong in self.entries:
+            return False
+        if len(self.entries) >= GLOSSARY_LIMIT:
+            del self.entries[next(iter(self.entries))]
+        self.entries[wrong] = right
+        return True
+
+    # 只差大小寫的對照（line → LINE）只套在日文句子上；英文句子裡的 line 多半是普通單字
+    def apply(self, text, language="ja"):
+        # 先套英文對照：片假名換成英文後，緊鄰的英文字（ショピファイトline）會失去字界
+        for wrong in sorted(self.entries, key=lambda item: (not LATIN.search(item), -len(item))):
+            right = self.entries[wrong]
+            if LATIN.search(wrong):
+                if language == "en" and wrong.lower() == right.lower():
+                    continue
+                text = re.sub(rf"(?<![A-Za-z]){re.escape(wrong)}(?![A-Za-z])", right, text, flags=re.IGNORECASE)
+            else:
+                text = text.replace(wrong, right)
+        return text
+
+    def terms(self):
+        return list(dict.fromkeys(self.entries.values()))
+
+    def describe(self):
+        grouped = {}
+        for wrong, right in self.entries.items():
+            grouped.setdefault(right, []).append(wrong)
+        return "、".join(f"{right}（误听：{'、'.join(wrongs)}）" for right, wrongs in grouped.items())
+
+
+FILLERS_BY_LENGTH = sorted(FILLERS, key=len, reverse=True)
+
+
+def is_filler_run(segment):
+    """整段都由語氣詞拼成（えーとあの、umuh）。"""
+    segment = segment.lower()
+    while segment:
+        for filler in FILLERS_BY_LENGTH:
+            if segment.startswith(filler):
+                segment = segment[len(filler):]
+                break
+        else:
+            return False
+    return True
+
+
+# 准刪的只有三種：語氣詞、緊鄰的重講（we can, we can）、重複了上一句結尾的開頭
+def allowed_deletion(a, i1, i2, previous):
+    segment = a[i1:i2]
+    if is_filler_run(segment):
+        return True
+    if a[i2:].startswith(segment) or a[:i1].endswith(segment):
+        return True
+    return i1 == 0 and bool(previous) and previous.endswith(segment)
+
+
+def accept_polish(original, polished, language, terms=(), previous=""):
+    """潤稿只准刪贅詞、刪重講、加標點，不准改字、不准加字；判定不過就沿用原文。
+    專有名詞的修正在這之前已由術語表做掉，所以不需要放行替換。回傳 (採用的文字或 None, 原因)。"""
+    if not polished or polished == original:
+        return None, "same"
+    if language == "ja" and not KANA.search(polished):
+        return None, "language"
+    if language == "en" and JAPANESE.search(polished):
+        return None, "language"
+    # 刪贅詞後殘留的助詞（えーとあの僕 → と僕）；原文本來就這個字開頭（はい）不算
+    if language == "ja" and PARTICLE_START.match(polished) and not original.startswith(polished[0]):
+        return None, "particle"
+    # 英文字只有術語表裡的才准改大小寫（sopifi → SOPIFI 會被翻譯當成縮寫照抄）；其他改回原樣
+    original_words = {word.lower(): word for word in LATIN_WORD.findall(original)}
+    for word in set(LATIN_WORD.findall(polished)):
+        if word.lower() in original_words and word != original_words[word.lower()] and word not in terms:
+            polished = re.sub(rf"(?<![A-Za-z]){re.escape(word)}(?![A-Za-z])", original_words[word.lower()], polished)
+    a = MATCH_STRIP.sub("", original)
+    b = MATCH_STRIP.sub("", polished)
+    if not a or not b:
+        return None, "empty"
+    if a == b:
+        return polished, "punct"
+    if len(b) / len(a) < POLISH_MIN_LENGTH:
+        return None, "length"
+    lowered = a.lower()
+    previous = MATCH_STRIP.sub("", previous).lower()
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, lowered, b.lower(), autojunk=False).get_opcodes():
+        if tag == "equal":
+            continue
+        if tag != "delete" or not allowed_deletion(lowered, i1, i2, previous):
+            return None, f"{tag} {a[i1:i2]}→{b[j1:j2]}"
+    return polished, "ok"
+
+
+class Polisher:
+    """用通用 LLM 潤稿與抽會議記憶。兩段 system prompt 各自預先算好 KV cache。"""
+
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.sampler = make_sampler(temp=0.0)
+        self.polish_prefix, self.polish_cache = self._cache(POLISH_SYSTEM_PROMPT)
+        self.memory_prefix, self.memory_cache = self._cache(MEMORY_SYSTEM_PROMPT)
+
+    def _prompt(self, system, user):
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False)
+
+    def _encode(self, text):
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
+    def _cache(self, system):
+        full = self._prompt(system, PREFIX_PROBE)
+        prefix = self._encode(full[: full.rfind(PREFIX_PROBE)])
+        if self._encode(full)[: len(prefix)] != prefix:
+            return None, None
+        cache = make_prompt_cache(self.model)
+        with gpu_lock:
+            for _ in stream_generate(self.model, self.tokenizer, prompt=prefix, max_tokens=1, prompt_cache=cache):
+                pass
+            trim_prompt_cache(cache, cache[0].offset - len(prefix))
+        return prefix, cache
+
+    def _generate(self, system, prefix, cache, user, max_tokens, timeout):
+        tokens = self._encode(self._prompt(system, user))
+        if prefix and tokens[: len(prefix)] == prefix:
+            tokens = tokens[len(prefix):]
+        else:
+            cache = None
+        started = time.monotonic()
+        pieces = []
+        timed_out = False
+        with gpu_lock:
+            try:
+                for response in stream_generate(self.model, self.tokenizer, prompt=tokens, max_tokens=max_tokens, prompt_cache=cache, sampler=self.sampler):
+                    pieces.append(response.text)
+                    if time.monotonic() - started > timeout:
+                        timed_out = True
+                        break
+            finally:
+                if cache is not None:
+                    trim_prompt_cache(cache, cache[0].offset - len(prefix))
+        return "".join(pieces).split("</think>")[-1].strip(), timed_out, time.monotonic() - started
+
+    def polish(self, text, language, context, topic, glossary):
+        user = f"【会议主题】{topic or '无'}\n【术语表】{glossary.describe() or '无'}\n【前文】{' / '.join(context) or '无'}\n【本句】{text}"
+        output, timed_out, elapsed = self._generate(POLISH_SYSTEM_PROMPT, self.polish_prefix, self.polish_cache, user, MAX_POLISH_TOKENS, POLISH_TIMEOUT)
+        if timed_out:
+            return None, "timeout", elapsed
+        match = next((POLISH_LINE.match(line) for line in output.splitlines() if POLISH_LINE.match(line)), None)
+        if match is None:
+            return None, "format", elapsed
+        polished = match.group(1).strip().strip('"“”「」『』')
+        if language == "ja":
+            polished = CJK_SPACE.sub("", polished)
+        accepted, reason = accept_polish(text, polished, language, glossary.terms(), context[-1] if context else "")
+        return accepted, reason, elapsed
+
+    def update_memory(self, recent, topic, glossary):
+        user = f"【当前主题】{topic or '无'}\n【当前术语表】{glossary.describe() or '无'}\n【最近的逐字稿】\n" + "\n".join(recent)
+        output, timed_out, elapsed = self._generate(MEMORY_SYSTEM_PROMPT, self.memory_prefix, self.memory_cache, user, MAX_MEMORY_TOKENS, MEMORY_TIMEOUT)
+        added = []
+        evidence = "\n".join(recent)
+        for line in output.splitlines():
+            if match := MEMORY_TOPIC_LINE.match(line):
+                candidate = match.group(1).strip()
+                if candidate and candidate not in ("无", "無"):
+                    topic = candidate[:TOPIC_LIMIT]
+            elif match := MEMORY_TERMS_LINE.match(line):
+                for pair in TERM_SPLIT.split(match.group(1)):
+                    if "=" in pair:
+                        wrong, right = pair.split("=", 1)
+                        if glossary.add(wrong, right, evidence):
+                            added.append(f"{wrong.strip()}={right.strip()}")
+        return topic, added, timed_out, elapsed
+
+
 class Translator:
-    def __init__(self, model, tokenizer, model_type="", refiner=None, name=""):
+    def __init__(self, model, tokenizer, model_type="", refiner=None, name="", polisher=None):
         self.refiner = refiner
+        self.polisher = polisher
+        self.glossary = Glossary()
+        self.topic = ""
+        self.recent = []
+        self.since_memory = 0
+        self.last_final_time = 0.0
         self.model = model
         self.tokenizer = tokenizer
         template = getattr(tokenizer, "chat_template", None) or ""
@@ -490,7 +742,7 @@ class Translator:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def _prompt_text(self, japanese, context=()):
+    def _prompt_text(self, japanese, context=(), topic="", terms=()):
         if self.style == "hunyuan_mt":
             return HUNYUAN_PREFIX + japanese + HUNYUAN_SUFFIX
         context_text = "".join(context)
@@ -498,6 +750,10 @@ class Translator:
             tasks = []
             if context_text:
                 tasks.append(f"这是会议的实时字幕，前文是：「{context_text}」，请结合前文理解语境，但不要翻译前文。")
+            if topic:
+                tasks.append(f"会议主题：{topic}。")
+            if terms:
+                tasks.append(f"术语表：{'、'.join(terms)}，译文中原样保留这些名词。")
             tasks.append(HY_MT2_RULES)
             tasks.append("将【待翻译文本】翻译为简体中文，只输出译文。")
             numbered = "\n".join(f"{index}、{task}" for index, task in enumerate(tasks, 1))
@@ -506,6 +762,10 @@ class Translator:
             system = CHAT_SYSTEM_PROMPT
             if context_text:
                 system += f"\n前文（仅供理解语境，不要翻译）：{context_text}"
+            if topic:
+                system += f"\n会议主题：{topic}"
+            if terms:
+                system += f"\n术语表：{'、'.join(terms)}（译文中原样保留）"
             messages = [
                 {"role": "system", "content": system},
                 {"role": "user", "content": japanese},
@@ -574,7 +834,7 @@ class Translator:
         return chinese
 
     def _generate_once(self, japanese, context=()):
-        tokens = self._encode(self._prompt_text(japanese, context))
+        tokens = self._encode(self._prompt_text(japanese, context, self.topic, self.glossary.terms()))
         cache = None
         if self.prefix_tokens and tokens[: len(self.prefix_tokens)] == self.prefix_tokens:
             tokens = tokens[len(self.prefix_tokens):]
@@ -589,15 +849,62 @@ class Translator:
                     trim_prompt_cache(cache, cache[0].offset - len(self.prefix_tokens))
         return self._clean("".join(text))
 
+    # 翻譯佇列空著、而且累積了 MEMORY_EVERY 句或閒置超過 MEMORY_IDLE_SECONDS 時更新會議記憶
+    def _memory_due(self):
+        if self.polisher is None or self.since_memory == 0:
+            return False
+        return self.since_memory >= MEMORY_EVERY or time.monotonic() - self.last_final_time >= MEMORY_IDLE_SECONDS
+
+    def _update_memory(self):
+        recent = list(self.recent)
+        self.since_memory = 0
+        try:
+            self.topic, added, timed_out, elapsed = self.polisher.update_memory(recent, self.topic, self.glossary)
+        except Exception as exc:
+            note(f"memory failed: {exc}")
+            return
+        note(f"memory {elapsed:.2f}s{' timeout' if timed_out else ''} topic={self.topic!r} added={added}")
+
+    # 先套術語表（純字串替換），再交給 LLM 潤稿；後面已有句子在等時跳過 LLM，中文不會越落越後
+    def _polish(self, utterance, text, language):
+        raw = text
+        self.recent = (self.recent + [raw])[-MEMORY_WINDOW:]
+        self.since_memory += 1
+        text = self.glossary.apply(text, language)
+        if self.polisher is not None:
+            with self.lock:
+                backlog = len(self.jobs)
+            if backlog:
+                note(f"polish skip utterance={utterance} backlog={backlog}")
+            elif len(MATCH_STRIP.sub("", text)) < POLISH_MIN_CHARS:
+                note(f"polish skip utterance={utterance} short {text!r}")
+            else:
+                try:
+                    polished, reason, elapsed = self.polisher.polish(text, language, tuple(self.history[-POLISH_CONTEXT:]), self.topic, self.glossary)
+                except Exception as exc:
+                    polished, reason, elapsed = None, f"error {exc}", 0.0
+                note(f"polish utterance={utterance} {elapsed:.2f}s {reason} {raw!r} -> {polished!r}")
+                if polished:
+                    text = polished
+        if text != raw:
+            emit("revised_japanese", utterance, text)
+        return text
+
     def _run(self):
         while True:
             with self.lock:
-                while not self.jobs and not self.closed:
-                    self.wake.wait()
-                if not self.jobs:
+                while not self.jobs and not self.closed and not self._memory_due():
+                    self.wake.wait(timeout=0.5)
+                if not self.jobs and self.closed:
                     return
-                utterance, japanese, audio, language = self.jobs.pop(0)
+                job = self.jobs.pop(0) if self.jobs else None
                 self.active = True
+            if job is None:
+                self._update_memory()
+                with self.lock:
+                    self.active = False
+                continue
+            utterance, japanese, audio, language = job
             if self.refiner is not None and audio:
                 started = time.monotonic()
                 try:
@@ -610,13 +917,13 @@ class Translator:
                 if chosen != japanese:
                     emit("revised_japanese", utterance, chosen)
                     japanese = chosen
+            japanese = self._polish(utterance, japanese, language)
             chinese = []
             if self.context_aware:
                 try:
-                    chinese.append(self._generate(japanese, tuple(self.history)))
+                    chinese.append(self._generate(japanese, tuple(self.history[-CONTEXT_UTTERANCES:])))
                 except Exception as exc:
                     emit("error", message=str(exc))
-                self.history = (self.history + [japanese])[-CONTEXT_UTTERANCES:]
             else:
                 for piece in self._pieces(japanese):
                     translated = self.memory.get(piece)
@@ -629,9 +936,41 @@ class Translator:
                         else:
                             self._remember(piece, translated)
                     chinese.append(translated)
+            self.history = (self.history + [japanese])[-max(CONTEXT_UTTERANCES, POLISH_CONTEXT):]
             emit("final", utterance, japanese, "".join(chinese))
+            # 閒置從翻完這句起算，背景更新才不會卡到緊接著的下一句
+            self.last_final_time = time.monotonic()
             with self.lock:
                 self.active = False
+
+
+# 選用元件的模型由 Models/<name>.txt 指定（環境變數優先）；內容為空或 none 視為關閉
+def optional_model_path(models_dir, env_name, file_name):
+    name = os.environ.get(env_name)
+    if name is None:
+        try:
+            with open(os.path.join(models_dir, file_name)) as handle:
+                name = handle.read().strip()
+        except OSError:
+            name = ""
+    if not name or name == "none":
+        return None
+    path = name if os.path.isabs(name) else os.path.join(models_dir, name)
+    return path if os.path.isdir(path) else None
+
+
+# 潤稿模型和翻譯模型相同時共用一份權重
+def load_polisher(path, translation_path, translation_model):
+    if path is None:
+        return None
+    emit("status", message="準備中")
+    if os.path.normpath(path) == os.path.normpath(translation_path):
+        model, tokenizer = translation_model
+    else:
+        model, tokenizer = load(path)
+    polisher = Polisher(model, tokenizer)
+    debug(f"polisher: {path} cached={polisher.polish_prefix is not None}")
+    return polisher
 
 
 def translate_only(translation_path):
@@ -639,9 +978,12 @@ def translate_only(translation_path):
         emit("error", message="尚未完成安裝")
         return 2
     emit("status", message="準備中")
+    models_dir = os.path.dirname(os.path.normpath(translation_path))
     with open(os.path.join(translation_path, "config.json")) as handle:
         model_type = json.load(handle).get("model_type", "")
-    translator = Translator(*load(translation_path), model_type=model_type, name=os.path.basename(os.path.normpath(translation_path)))
+    model, tokenizer = load(translation_path)
+    polisher = load_polisher(optional_model_path(models_dir, "LIVE_TRANSLATOR_POLISH_MODEL", "polish-model.txt"), translation_path, (model, tokenizer))
+    translator = Translator(model, tokenizer, model_type=model_type, name=os.path.basename(os.path.normpath(translation_path)), polisher=polisher)
     debug(f"translate-only style={translator.style}")
     emit("ready", message="就緒")
     for line in sys.stdin:
@@ -654,7 +996,7 @@ def translate_only(translation_path):
             continue
         text = str(job.get("text", "")).strip()
         if text:
-            translator.submit(int(job.get("utterance", 0)), text)
+            translator.submit(int(job.get("utterance", 0)), text, language=job.get("language") or language_of(text))
     translator.close()
     return 0
 
@@ -685,20 +1027,19 @@ def main():
     emit("status", message="準備中")
     with open(os.path.join(translation_path, "config.json")) as handle:
         model_type = json.load(handle).get("model_type", "")
-    refiner_name = os.environ.get("LIVE_TRANSLATOR_FINAL_MODEL")
-    if refiner_name is None:
-        try:
-            with open(os.path.join(models_dir, "final-model.txt")) as handle:
-                refiner_name = handle.read().strip()
-        except OSError:
-            refiner_name = ""
-    refiner_path = refiner_name if os.path.isabs(refiner_name) else os.path.join(models_dir, refiner_name)
+    polish_path = optional_model_path(models_dir, "LIVE_TRANSLATOR_POLISH_MODEL", "polish-model.txt")
+    refiner_path = optional_model_path(models_dir, "LIVE_TRANSLATOR_FINAL_MODEL", "final-model.txt")
     refiner = None
-    if refiner_name and refiner_name != "none" and os.path.isdir(refiner_path):
+    if refiner_path and polish_path:
+        # 兩個都開記憶體會超過 16 GB 機器能負荷的量；潤稿優先
+        debug(f"refiner disabled because polisher is on")
+    elif refiner_path:
         emit("status", message="準備中")
         refiner = Refiner(refiner_path)
     debug(f"refiner: {refiner_path if refiner else None}")
-    translator = Translator(*load(translation_path), model_type=model_type, refiner=refiner, name=os.path.basename(os.path.normpath(translation_path)))
+    model, tokenizer = load(translation_path)
+    polisher = load_polisher(polish_path, translation_path, (model, tokenizer))
+    translator = Translator(model, tokenizer, model_type=model_type, refiner=refiner, name=os.path.basename(os.path.normpath(translation_path)), polisher=polisher)
     debug(f"translator style={translator.style} prefix_cached={translator.prefix_tokens is not None}")
     emit("ready", message="就緒")
 

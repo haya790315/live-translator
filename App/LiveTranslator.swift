@@ -363,7 +363,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var engineButton: NSButton!
     private var translationButton: NSButton!
     private var refineButton: NSButton!
+    private var polishButton: NSButton!
     private var activeRefine = false
+    private var activePolish = false
     private var activeTranslation = ""
     private let recorder = AudioRecorder()
     private var nameField: NSTextField!
@@ -529,7 +531,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         refineButton.isBordered = false
         refineButton.bezelStyle = .regularSquare
         refineButton.translatesAutoresizingMaskIntoConstraints = false
+        polishButton = NSButton(title: "", target: self, action: #selector(togglePolish))
+        polishButton.isBordered = false
+        polishButton.bezelStyle = .regularSquare
+        polishButton.translatesAutoresizingMaskIntoConstraints = false
         updateEngineButton()
+        updatePolishButton()
         translationButton = NSButton(title: "", target: self, action: #selector(showTranslationMenu))
         translationButton.isBordered = false
         translationButton.bezelStyle = .regularSquare
@@ -540,13 +547,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         indicator.translatesAutoresizingMaskIntoConstraints = false
         indicator.addSubview(statusDot)
         indicator.addSubview(spinner)
-        let top = NSStackView(views: [indicator, statusLabel, engineButton, refineButton, translationButton, nameField, suffixLabel, endButton, toggleButton])
+        let top = NSStackView(views: [indicator, statusLabel, engineButton, refineButton, polishButton, translationButton, nameField, suffixLabel, endButton, toggleButton])
         top.orientation = .horizontal
         top.alignment = .centerY
         top.distribution = .fill
         top.spacing = 8
         top.setCustomSpacing(10, after: engineButton)
         top.setCustomSpacing(10, after: refineButton)
+        top.setCustomSpacing(10, after: polishButton)
         top.setCustomSpacing(12, after: translationButton)
         top.setCustomSpacing(0, after: nameField)
         top.setCustomSpacing(12, after: suffixLabel)
@@ -560,6 +568,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         translationButton.setContentHuggingPriority(.required, for: .horizontal)
         refineButton.setContentHuggingPriority(.required, for: .horizontal)
         refineButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        polishButton.setContentHuggingPriority(.required, for: .horizontal)
+        polishButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         translationButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         suffixLabel.setContentHuggingPriority(.required, for: .horizontal)
         nameWidth = nameField.widthAnchor.constraint(equalToConstant: 100)
@@ -702,7 +712,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func resume() {
         NSLog("action: resume")
         guard worker?.isRunning == true, sink != nil, usesAnalyzer != prefersParakeet, activeTranslation == (preferredTranslation ?? ""),
-              usesAnalyzer || activeRefine == refineEnabled else {
+              activePolish == polishEnabled, usesAnalyzer || activeRefine == refineEnabled else {
             start(fresh: false)
             return
         }
@@ -822,13 +832,68 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 alert.runModal()
                 return
             }
+            // 和潤稿互斥：兩個一起開記憶體會超過 16 GB 機器能負荷的量
+            try? FileManager.default.removeItem(at: polishChoiceURL)
             try? "\(Self.refineModel)\n".write(to: refineChoiceURL, atomically: true, encoding: .utf8)
         }
         NSLog("action: refine %@", refineEnabled ? "on" : "off")
         updateRefineButton()
+        updatePolishButton()
         switch state {
         case .preparing, .listening:
             if !usesAnalyzer { restartEngine() }
+        case .paused, .ended, .problem:
+            break
+        }
+    }
+
+    private static let polishModel = "Qwen3-4B-4bit"
+
+    private var polishChoiceURL: URL {
+        projectRoot().appendingPathComponent("Models/polish-model.txt")
+    }
+
+    // worker 啟動時讀 polish-model.txt；內容為空或 none 視為關閉
+    private var polishEnabled: Bool {
+        guard let value = try? String(contentsOf: polishChoiceURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+        return !value.isEmpty && value != "none"
+    }
+
+    private func updatePolishButton() {
+        let on = polishEnabled
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: on ? NSColor(srgbRed: 1.0, green: 0.85, blue: 0.42, alpha: 1.0) : NSColor.white.withAlphaComponent(0.3)
+        ]
+        polishButton.attributedTitle = NSAttributedString(string: on ? "潤稿：開" : "潤稿：關", attributes: attributes)
+        polishButton.toolTip = on
+            ? "每句定稿後先修正專有名詞、刪贅詞、補標點再翻譯，中文晚 1～2 秒、多佔 2.1 GB 記憶體。點一下關閉"
+            : "點一下開啟：每句定稿後先修正專有名詞、刪贅詞、補標點再翻譯，中文晚 1～2 秒、多佔 2.1 GB 記憶體"
+    }
+
+    @objc private func togglePolish() {
+        if polishEnabled {
+            try? FileManager.default.removeItem(at: polishChoiceURL)
+        } else {
+            let model = projectRoot().appendingPathComponent("Models/\(Self.polishModel)")
+            guard FileManager.default.fileExists(atPath: model.path) else {
+                let alert = NSAlert()
+                alert.messageText = "尚未下載 Qwen3-4B 模型"
+                alert.informativeText = "缺少 Models/\(Self.polishModel)。下載方式見 Docs/SETUP.md 第 9 節「選用：定稿後先潤稿再翻譯」。"
+                alert.runModal()
+                return
+            }
+            // 和 Qwen 重解互斥：兩個一起開記憶體會超過 16 GB 機器能負荷的量
+            try? FileManager.default.removeItem(at: refineChoiceURL)
+            try? "\(Self.polishModel)\n".write(to: polishChoiceURL, atomically: true, encoding: .utf8)
+        }
+        NSLog("action: polish %@", polishEnabled ? "on" : "off")
+        updatePolishButton()
+        updateRefineButton()
+        // 潤稿在 worker 裡，兩種辨識引擎都適用：正在聽時立刻重啟，其他狀態下次開始時套用
+        switch state {
+        case .preparing, .listening:
+            restartEngine()
         case .paused, .ended, .problem:
             break
         }
@@ -1199,6 +1264,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let root = projectRoot()
         usesAnalyzer = !prefersParakeet
         activeRefine = refineEnabled
+        activePolish = polishEnabled
         utteranceBase = entries.map(\.utterance).max() ?? 0
         updateEngineButton()
         NSLog("speech engine: %@", usesAnalyzer ? "SpeechAnalyzer" : "parakeet")
@@ -1363,7 +1429,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         engineBox = engine
         utteranceBase = entries.map(\.utterance).max() ?? 0
         engine.onPartial = { [weak self] text in self?.analyzerPartial(text) }
-        engine.onFinal = { [weak self] id, text, _ in self?.analyzerFinal(id: id, text: text, sink: sink) }
+        engine.onFinal = { [weak self] id, text, language in self?.analyzerFinal(id: id, text: text, language: language, sink: sink) }
         engine.onRevise = { [weak self] id, text in self?.analyzerRevise(id: id, text: text, sink: sink) }
         engine.onError = { [weak self] message in
             NSLog("speech engine error: %@", message)
@@ -1390,17 +1456,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         if running { setState(.listening) }
     }
 
-    private func sendForTranslation(utterance: Int, text: String, sink: AudioSink) {
-        guard let line = try? JSONSerialization.data(withJSONObject: ["utterance": utterance, "text": text]) else { return }
+    // language 是 ja 或 en；沒給時 worker 自己從文字判斷
+    private func sendForTranslation(utterance: Int, text: String, language: String? = nil, sink: AudioSink) {
+        var job: [String: Any] = ["utterance": utterance, "text": text]
+        if let language { job["language"] = language }
+        guard let line = try? JSONSerialization.data(withJSONObject: job) else { return }
         sink.write(line + Data([10]))
     }
 
-    private func analyzerFinal(id: Int, text: String, sink: AudioSink) {
+    private func analyzerFinal(id: Int, text: String, language: String, sink: AudioSink) {
         let utterance = utteranceBase + id
         entries.append(TranscriptEntry(utterance: utterance, time: clock.string(from: Date()), japanese: text, chinese: nil))
         renderTranscript()
         refreshSavedFile()
-        sendForTranslation(utterance: utterance, text: text, sink: sink)
+        sendForTranslation(utterance: utterance, text: text, language: language, sink: sink)
     }
 
     private func analyzerRevise(id: Int, text: String, sink: AudioSink) {

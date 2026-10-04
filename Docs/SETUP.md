@@ -204,7 +204,7 @@ macOS 26 上第一次啟動時，SpeechAnalyzer 會向 Apple 下載日文與英�
 
 ## 8. 操作與逐字稿
 
-底部列由左到右：狀態燈、狀態文字、辨識引擎（Apple／parakeet）、檔名欄（終止後出現）、終止、暫停／繼續。
+底部列由左到右：狀態燈、狀態文字、辨識引擎（Apple／parakeet）、Qwen 重解（只在 parakeet 模式顯示）、潤稿、翻譯模型、檔名欄（終止後出現）、終止、暫停／繼續。
 
 開始一段時就自動建立一個資料夾，逐字稿與錄音放在裡面，三者同名，邊聽邊寫入，不必另外按儲存或錄音：
 
@@ -280,6 +280,36 @@ uv pip install --python .venv/bin/python "mlx-audio[stt]"
 ```
 
 下載後，在 parakeet 模式下點底列的「Qwen 重解：關／開」切換（Apple 模式下不顯示）。正在聽時會立刻重啟套用，暫停時下次繼續才套用。設定寫在 `Models/final-model.txt`（內容為模型目錄名；檔案不存在就是關閉）。
+
+### 選用：定稿後先潤稿再翻譯
+
+兩種辨識引擎都適用，預設關閉。開啟後每句定稿時先經過兩步再翻譯：
+
+1. 套用術語表：把這場會議中學到的聽錯寫法換成正確寫法（`ショピファイト`→`Shopify`、`sopifi`→`Shopify`），純字串替換，不經過模型
+2. Qwen3-4B 潤稿：刪語氣詞（えー、あの、um）、刪緊鄰的重講（we can, we can）、刪與上一句結尾重複的開頭、補標點。只准刪和加標點；模型改了字、加了字、換了語尾，整句不採用，沿用原文
+
+翻譯時 Hy-MT2 的提示詞多帶會議主題與術語表。術語表和會議主題由 Qwen3-4B 在翻譯佇列空著時從最近 8 句原始文字抽出來，每 6 句或閒置 3 秒更新一次；聽錯寫法必須真的出現在逐字稿裡才收錄。
+
+代價：每句中文晚 1～2.5 秒、權重多 2.1 GB。和「Qwen 重解」互斥，開一個另一個自動關。
+
+模型與第 9 節翻譯模型清單裡的 `Qwen3-4B-4bit` 是同一份，翻譯模型也選它時共用權重：
+
+```bash
+cd "${REPO_ROOT}"
+.venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('mlx-community/Qwen3-4B-4bit', local_dir='Models/Qwen3-4B-4bit')"
+```
+
+下載後點底列的「潤稿：關／開」切換。正在聽時會立刻重啟套用，暫停時下次繼續才套用。設定寫在 `Models/polish-model.txt`（內容為模型目錄名；檔案不存在就是關閉）。
+
+每句潤稿前後的對照寫在 `Logs/app.log`：
+
+```text
+[worker] polish utterance=17 1.96s punct '僕の方があまり詳しくない気もしますけど一旦話お伺いできるかなと思います。' -> '僕の方があまり詳しくない気もしますけど、一旦話お伺いできるかなと思います。'
+[worker] polish utterance=15 1.07s replace ですか→ません 'いらっしゃらないですかね。' -> None
+[worker] memory 2.22s topic='讨论Shopify与LINE的整合方案' added=['sopifi=Shopify', 'ショピファイト=Shopify']
+```
+
+`ok`／`punct` 是採用；`same` 是模型沒改；`replace`、`insert`、`delete …`、`particle`、`length` 是模型的改動被擋下、沿用原文；`skip short` 與 `skip backlog` 是短句或後面已有句子在等，直接跳過潤稿。
 
 ## 10. 問題排除
 
