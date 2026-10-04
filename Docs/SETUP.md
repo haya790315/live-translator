@@ -283,14 +283,15 @@ uv pip install --python .venv/bin/python "mlx-audio[stt]"
 
 ### 選用：定稿後先潤稿再翻譯
 
-兩種辨識引擎都適用，預設關閉。開啟後每句定稿時先經過兩步再翻譯：
+兩種辨識引擎都適用，預設關閉。開啟後每句定稿時：
 
-1. 套用術語表：把這場會議中學到的聽錯寫法換成正確寫法（`ショピファイト`→`Shopify`、`sopifi`→`Shopify`），純字串替換，不經過模型
-2. Qwen3-4B 潤稿：刪語氣詞（えー、あの、um）、刪緊鄰的重講（we can, we can）、刪與上一句結尾重複的開頭、補標點。只准刪和加標點；模型改了字、加了字、換了語尾，整句不採用，沿用原文
+1. 翻譯前套用術語表：把這場會議中學到的聽錯寫法換成正確寫法（`ショピファイト`→`Shopify`、`sopifi`→`Shopify`），純字串替換，不經過模型
+2. 翻譯時 Hy-MT2 的提示詞多帶會議主題與術語表
+3. 翻譯完、佇列空著時，Qwen3-4B 潤稿原文：刪語氣詞（えー、あの、um）、刪緊鄰的重講（we can, we can）、刪與上一句結尾重複的開頭、補標點，完成後替換字幕與逐字稿上的原文。只准刪和加標點；模型改了字、加了字、換了語尾，整句不採用。新句子一到就中止潤稿，所以中文不會因為它變慢；代價是講話不停時潤稿常常來不及完成
 
-翻譯時 Hy-MT2 的提示詞多帶會議主題與術語表。術語表和會議主題由 Qwen3-4B 在翻譯佇列空著時從最近 8 句原始文字抽出來，每 6 句或閒置 3 秒更新一次；聽錯寫法必須真的出現在逐字稿裡才收錄。
+術語表和會議主題由 Qwen3-4B 在翻譯佇列空著時從最近 8 句原始文字抽出來，每 6 句或閒置 3 秒更新一次。聽錯寫法必須真的出現在逐字稿裡、正確寫法至少兩個字、兩者開頭子音同類（`ショピファイト`→`Shopify` 可以，`ショピファイト`→`LINE` 不行）才收錄。
 
-代價：每句中文晚 1～2.5 秒、權重多 2.1 GB。和「Qwen 重解」互斥，開一個另一個自動關。
+代價：權重多 2.1 GB。Apple 模式下 worker 共約 4 GB，parakeet 模式下共約 6.4 GB，16 GB 機器開著瀏覽器就會 swap、整體變慢，潤稿會大量超時。和「Qwen 重解」互斥，開一個另一個自動關。
 
 模型與第 9 節翻譯模型清單裡的 `Qwen3-4B-4bit` 是同一份，翻譯模型也選它時共用權重：
 
@@ -304,12 +305,14 @@ cd "${REPO_ROOT}"
 每句潤稿前後的對照寫在 `Logs/app.log`：
 
 ```text
+[worker] translate utterance=17 1.12s
 [worker] polish utterance=17 1.96s punct '僕の方があまり詳しくない気もしますけど一旦話お伺いできるかなと思います。' -> '僕の方があまり詳しくない気もしますけど、一旦話お伺いできるかなと思います。'
 [worker] polish utterance=15 1.07s replace ですか→ません 'いらっしゃらないですかね。' -> None
-[worker] memory 2.22s topic='讨论Shopify与LINE的整合方案' added=['sopifi=Shopify', 'ショピファイト=Shopify']
+[worker] polish utterance=18 0.84s preempted '分かりました、じゃあ、ちょっと一回閉めて。' -> None
+[worker] memory 2.22s ok topic='讨论Shopify与LINE的整合方案' added=['sopifi=Shopify', 'ショピファイト=Shopify']
 ```
 
-`ok`／`punct` 是採用；`same` 是模型沒改；`replace`、`insert`、`delete …`、`particle`、`length` 是模型的改動被擋下、沿用原文；`skip short` 與 `skip backlog` 是短句或後面已有句子在等，直接跳過潤稿。
+`ok`／`punct` 是採用；`same` 是模型沒改；`replace`、`insert`、`delete …`、`particle`、`length` 是模型的改動被擋下、沿用原文；`preempted` 是新句子到了、潤稿中止；`timeout` 是超過 6 秒放棄；`skip short` 是短句不送模型。
 
 ## 10. 問題排除
 

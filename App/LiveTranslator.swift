@@ -867,8 +867,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         ]
         polishButton.attributedTitle = NSAttributedString(string: on ? "潤稿：開" : "潤稿：關", attributes: attributes)
         polishButton.toolTip = on
-            ? "每句定稿後先修正專有名詞、刪贅詞、補標點再翻譯，中文晚 1～2 秒、多佔 2.1 GB 記憶體。點一下關閉"
-            : "點一下開啟：每句定稿後先修正專有名詞、刪贅詞、補標點再翻譯，中文晚 1～2 秒、多佔 2.1 GB 記憶體"
+            ? "用 Qwen3-4B 學會議中的專有名詞與主題給翻譯參考，並在空檔替原文刪贅詞、補標點；多佔 2.1 GB 記憶體。點一下關閉"
+            : "點一下開啟：用 Qwen3-4B 學會議中的專有名詞與主題給翻譯參考，並在空檔替原文刪贅詞、補標點；多佔 2.1 GB 記憶體"
     }
 
     @objc private func togglePolish() {
