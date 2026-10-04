@@ -224,6 +224,111 @@ final class AudioSink {
     }
 }
 
+// 把擷取到的 16 kHz 單聲道 float32 音訊存成 16-bit WAV，與逐字稿放在同一個資料夾、同名
+final class AudioRecorder {
+    private let queue = DispatchQueue(label: "LiveTranslator.AudioRecorder")
+    private var handle: FileHandle?
+    private var url: URL?
+    private var writing = false
+    private var dataBytes: UInt32 = 0
+
+    func open(at target: URL) {
+        queue.sync {
+            guard FileManager.default.createFile(atPath: target.path, contents: Self.header(dataBytes: 0)),
+                  let opened = try? FileHandle(forWritingTo: target) else {
+                NSLog("recorder: cannot create %@", target.path)
+                return
+            }
+            _ = try? opened.seekToEnd()
+            handle = opened
+            url = target
+            writing = false
+            dataBytes = 0
+        }
+    }
+
+    func resume() {
+        queue.sync { writing = handle != nil }
+    }
+
+    func pause() {
+        queue.sync { writing = false }
+    }
+
+    func append(_ data: Data) {
+        queue.async { [self] in
+            guard writing, let handle else { return }
+            let pcm = data.withUnsafeBytes { raw -> Data in
+                let samples = raw.bindMemory(to: Float.self)
+                var output = [Int16](repeating: 0, count: samples.count)
+                for index in 0..<samples.count {
+                    output[index] = Int16((max(-1, min(1, samples[index])) * 32767).rounded()).littleEndian
+                }
+                return output.withUnsafeBytes { Data($0) }
+            }
+            guard (try? handle.write(contentsOf: pcm)) != nil else { return }
+            dataBytes &+= UInt32(pcm.count)
+            updateHeader()
+        }
+    }
+
+    func move(to target: URL) {
+        queue.sync {
+            guard let current = url, current != target else { return }
+            do {
+                try FileManager.default.moveItem(at: current, to: target)
+                url = target
+            } catch {
+                NSLog("recorder: move failed: %@", error.localizedDescription)
+            }
+        }
+    }
+
+    // 資料夾改名後，已開啟的檔案仍可繼續寫入，只需更新記錄的路徑
+    func relocate(to target: URL) {
+        queue.sync { if url != nil { url = target } }
+    }
+
+    func finish(deleteFile: Bool) {
+        queue.sync {
+            try? handle?.close()
+            handle = nil
+            writing = false
+            if deleteFile, let url { try? FileManager.default.removeItem(at: url) }
+            url = nil
+        }
+    }
+
+    private func updateHeader() {
+        guard let handle, let end = try? handle.offset() else { return }
+        var riff = (dataBytes &+ 36).littleEndian
+        var size = dataBytes.littleEndian
+        try? handle.seek(toOffset: 4)
+        try? handle.write(contentsOf: Data(bytes: &riff, count: 4))
+        try? handle.seek(toOffset: 40)
+        try? handle.write(contentsOf: Data(bytes: &size, count: 4))
+        try? handle.seek(toOffset: end)
+    }
+
+    private static func header(dataBytes: UInt32) -> Data {
+        var data = Data()
+        func append<T: FixedWidthInteger>(_ value: T) { withUnsafeBytes(of: value.littleEndian) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: Array("RIFF".utf8))
+        append(UInt32(36) &+ dataBytes)
+        data.append(contentsOf: Array("WAVEfmt ".utf8))
+        append(UInt32(16))
+        append(UInt16(1))
+        append(UInt16(1))
+        append(UInt32(16000))
+        append(UInt32(16000 * 2))
+        append(UInt16(2))
+        append(UInt16(16))
+        data.append(contentsOf: Array("data".utf8))
+        append(dataBytes)
+        return data
+    }
+}
+
 final class SubtitlePanel: NSPanel {
     override func cancelOperation(_ sender: Any?) {}
 }
@@ -255,7 +360,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var transcriptView: NSTextView!
     private var toggleButton: NSButton!
     private var endButton: NSButton!
-    private var saveButton: NSButton!
+    private var engineButton: NSButton!
+    private var translationButton: NSButton!
+    private var refineButton: NSButton!
+    private var activeRefine = false
+    private var activeTranslation = ""
+    private let recorder = AudioRecorder()
     private var nameField: NSTextField!
     private var nameWidth: NSLayoutConstraint!
     private var suffixLabel: NSTextField!
@@ -327,7 +437,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     func applicationWillTerminate(_ notification: Notification) {
         NSLog("applicationWillTerminate")
-        autosaveIfNeeded()
+        refreshSavedFile()
+        closeSession()
         cancelEngine()
         sink?.close()
         if worker?.isRunning == true { worker?.terminate() }
@@ -394,9 +505,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         toggleButton = makeIconButton(action: #selector(toggle))
         endButton = makeIconButton(action: #selector(end))
         setSymbol(endButton, "stop.fill", tip: "終止這一段")
-        saveButton = makeIconButton(action: #selector(save))
-        setSymbol(saveButton, "square.and.arrow.down", tip: "儲存逐字稿")
-        saveButton.contentTintColor = NSColor(srgbRed: 1.0, green: 0.85, blue: 0.42, alpha: 1.0)
         nameField = NSTextField(string: "")
         nameField.isBordered = false
         nameField.drawsBackground = false
@@ -407,30 +515,52 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         nameField.lineBreakMode = .byClipping
         nameField.alignment = .right
         nameField.delegate = self
-        nameField.toolTip = "點一下修改檔名"
+        nameField.toolTip = "點一下修改檔名，逐字稿與錄音一起改"
         nameField.translatesAutoresizingMaskIntoConstraints = false
         suffixLabel = NSTextField(labelWithString: ".txt")
         suffixLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         suffixLabel.textColor = NSColor.white.withAlphaComponent(0.45)
+        engineButton = NSButton(title: "", target: self, action: #selector(switchEngine))
+        engineButton.isBordered = false
+        engineButton.bezelStyle = .regularSquare
+        engineButton.translatesAutoresizingMaskIntoConstraints = false
+        if #unavailable(macOS 26.0) { engineButton.isHidden = true }
+        refineButton = NSButton(title: "", target: self, action: #selector(toggleRefine))
+        refineButton.isBordered = false
+        refineButton.bezelStyle = .regularSquare
+        refineButton.translatesAutoresizingMaskIntoConstraints = false
+        updateEngineButton()
+        translationButton = NSButton(title: "", target: self, action: #selector(showTranslationMenu))
+        translationButton.isBordered = false
+        translationButton.bezelStyle = .regularSquare
+        translationButton.translatesAutoresizingMaskIntoConstraints = false
+        updateTranslationButton()
 
         let indicator = NSView()
         indicator.translatesAutoresizingMaskIntoConstraints = false
         indicator.addSubview(statusDot)
         indicator.addSubview(spinner)
-        let top = NSStackView(views: [indicator, statusLabel, nameField, suffixLabel, saveButton, endButton, toggleButton])
+        let top = NSStackView(views: [indicator, statusLabel, engineButton, refineButton, translationButton, nameField, suffixLabel, endButton, toggleButton])
         top.orientation = .horizontal
         top.alignment = .centerY
         top.distribution = .fill
         top.spacing = 8
+        top.setCustomSpacing(10, after: engineButton)
+        top.setCustomSpacing(10, after: refineButton)
+        top.setCustomSpacing(12, after: translationButton)
         top.setCustomSpacing(0, after: nameField)
         top.setCustomSpacing(12, after: suffixLabel)
-        top.setCustomSpacing(2, after: saveButton)
         top.setCustomSpacing(2, after: endButton)
         statusLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         toggleButton.setContentHuggingPriority(.required, for: .horizontal)
         endButton.setContentHuggingPriority(.required, for: .horizontal)
-        saveButton.setContentHuggingPriority(.required, for: .horizontal)
+        engineButton.setContentHuggingPriority(.required, for: .horizontal)
+        engineButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        translationButton.setContentHuggingPriority(.required, for: .horizontal)
+        refineButton.setContentHuggingPriority(.required, for: .horizontal)
+        refineButton.setContentCompressionResistancePriority(.required, for: .horizontal)
+        translationButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         suffixLabel.setContentHuggingPriority(.required, for: .horizontal)
         nameWidth = nameField.widthAnchor.constraint(equalToConstant: 100)
         NSLayoutConstraint.activate([
@@ -446,8 +576,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             toggleButton.heightAnchor.constraint(equalToConstant: 24),
             endButton.widthAnchor.constraint(equalToConstant: 28),
             endButton.heightAnchor.constraint(equalToConstant: 24),
-            saveButton.widthAnchor.constraint(equalToConstant: 28),
-            saveButton.heightAnchor.constraint(equalToConstant: 24),
             nameWidth
         ])
 
@@ -535,6 +663,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         endingWorker = worker != nil
         let oldEngine = engineBox
         engineBox = nil
+        recorder.pause()
         Task { @MainActor in
             await oldCapture?.stop()
             if #available(macOS 26.0, *), let engine = oldEngine as? SpeechEngine {
@@ -542,30 +671,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             }
             oldSink?.close()
         }
-        savedURL = nil
-        nameField.stringValue = uniqueName(base: dateName())
+        refreshSavedFile()
+        nameField.stringValue = savedURL?.deletingPathExtension().lastPathComponent ?? ""
         updateNameWidth()
-        setState(.ended)
-    }
-
-    @objc private func save() {
-        NSLog("action: save")
-        panel.makeFirstResponder(nil)
-        guard hasContent else {
-            statusLabel.stringValue = "沒有可儲存的內容"
-            return
-        }
-        var name = sanitizedName(nameField.stringValue)
-        if name.isEmpty { name = dateName() }
-        var url = transcriptsDirectory().appendingPathComponent("\(name).txt")
-        if url != savedURL, FileManager.default.fileExists(atPath: url.path) {
-            name = uniqueName(base: name)
-            url = transcriptsDirectory().appendingPathComponent("\(name).txt")
-        }
-        nameField.stringValue = name
-        updateNameWidth()
-        writeTranscript(to: url, title: name)
-        savedURL = url
         setState(.ended)
     }
 
@@ -581,6 +689,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let oldCapture = capture
         capture = nil
         let engine = engineBox
+        recorder.pause()
         Task { @MainActor in
             await oldCapture?.stop()
             if #available(macOS 26.0, *), let engine = engine as? SpeechEngine {
@@ -592,7 +701,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func resume() {
         NSLog("action: resume")
-        guard worker?.isRunning == true, sink != nil else {
+        guard worker?.isRunning == true, sink != nil, usesAnalyzer != prefersParakeet, activeTranslation == (preferredTranslation ?? ""),
+              usesAnalyzer || activeRefine == refineEnabled else {
             start(fresh: false)
             return
         }
@@ -601,17 +711,263 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         beginCapture()
     }
 
-    private func startNewSession() {
-        if savedURL == nil && hasContent {
-            let alert = NSAlert()
-            alert.messageText = "這段紀錄尚未儲存"
-            alert.informativeText = "開始新的一段會清掉目前的字幕。要放棄這段紀錄嗎？"
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "放棄並開始")
-            alert.addButton(withTitle: "取消")
-            guard alert.runModal() == .alertFirstButtonReturn else { return }
+    private static let parakeetJapanese = "Models/parakeet-tdt_ctc-0.6b-ja"
+    private static let parakeetEnglish = "Models/parakeet-tdt-0.6b-v3"
+
+    private var engineChoiceURL: URL {
+        projectRoot().appendingPathComponent("Models/speech-engine.txt")
+    }
+
+    private var prefersParakeet: Bool {
+        guard #available(macOS 26.0, *) else { return true }
+        let choice = (try? String(contentsOf: engineChoiceURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return choice == "parakeet"
+    }
+
+    private func updateEngineButton() {
+        let parakeet = prefersParakeet
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.55)
+        ]
+        engineButton.attributedTitle = NSAttributedString(string: parakeet ? "parakeet" : "Apple", attributes: attributes)
+        engineButton.toolTip = parakeet
+            ? "語音辨識：parakeet（日文、英文），點一下切換成 Apple SpeechAnalyzer"
+            : "語音辨識：Apple SpeechAnalyzer（日文、英文），點一下切換成 parakeet"
+        updateRefineButton()
+    }
+
+    @objc private func switchEngine() {
+        let toParakeet = !prefersParakeet
+        NSLog("action: switch engine to %@", toParakeet ? "parakeet" : "SpeechAnalyzer")
+        if toParakeet {
+            let root = projectRoot()
+            let missing = [Self.parakeetJapanese, Self.parakeetEnglish].filter {
+                !FileManager.default.fileExists(atPath: root.appendingPathComponent($0).appendingPathComponent("model.safetensors").path)
+            }
+            guard missing.isEmpty else {
+                let alert = NSAlert()
+                alert.messageText = "尚未下載 parakeet 模型"
+                alert.informativeText = "缺少 \(missing.joined(separator: "、"))。請在專案目錄執行：\nLIVE_TRANSLATOR_PARAKEET=1 .venv/bin/python Scripts/download_models.py"
+                alert.runModal()
+                return
+            }
+            try? "parakeet\n".write(to: engineChoiceURL, atomically: true, encoding: .utf8)
+        } else {
+            try? FileManager.default.removeItem(at: engineChoiceURL)
         }
+        updateEngineButton()
+        // 暫停、已終止、出錯時只記下選擇，下次開始時套用；正在聽時立刻換
+        switch state {
+        case .preparing, .listening:
+            restartEngine()
+        case .paused, .ended, .problem:
+            break
+        }
+    }
+
+    private func restartEngine() {
+        starting = false
+        running = false
+        let oldCapture = capture
+        capture = nil
+        Task { @MainActor in
+            await oldCapture?.stop()
+            self.liveJapanese = ""
+            self.liveStable = ""
+            self.start(fresh: false)
+        }
+    }
+
+    private func startNewSession() {
         start(fresh: true)
+    }
+
+    private static let refineModel = "Qwen3-ASR-1.7B-8bit"
+
+    private var refineChoiceURL: URL {
+        projectRoot().appendingPathComponent("Models/final-model.txt")
+    }
+
+    // worker 啟動時讀 final-model.txt；內容為空或 none 視為關閉
+    private var refineEnabled: Bool {
+        guard let value = try? String(contentsOf: refineChoiceURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+        return !value.isEmpty && value != "none"
+    }
+
+    private func updateRefineButton() {
+        // 只有 parakeet 模式會重新辨識，Apple 模式下隱藏
+        refineButton.isHidden = !prefersParakeet
+        let on = refineEnabled
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: on ? NSColor(srgbRed: 1.0, green: 0.85, blue: 0.42, alpha: 1.0) : NSColor.white.withAlphaComponent(0.3)
+        ]
+        refineButton.attributedTitle = NSAttributedString(string: on ? "Qwen 重解：開" : "Qwen 重解：關", attributes: attributes)
+        refineButton.toolTip = on
+            ? "每句定稿後用 Qwen3-ASR 重新辨識，較準但中文晚 1～2 秒、多佔 2.5 GB 記憶體。點一下關閉"
+            : "點一下開啟：每句定稿後用 Qwen3-ASR 重新辨識，較準但中文晚 1～2 秒、多佔 2.5 GB 記憶體"
+    }
+
+    @objc private func toggleRefine() {
+        if refineEnabled {
+            try? FileManager.default.removeItem(at: refineChoiceURL)
+        } else {
+            let model = projectRoot().appendingPathComponent("Models/\(Self.refineModel)")
+            guard FileManager.default.fileExists(atPath: model.path) else {
+                let alert = NSAlert()
+                alert.messageText = "尚未下載 Qwen3-ASR 模型"
+                alert.informativeText = "缺少 Models/\(Self.refineModel)。下載方式見 Docs/SETUP.md 第 9 節「選用：定稿後用 Qwen3-ASR 重新辨識」。"
+                alert.runModal()
+                return
+            }
+            try? "\(Self.refineModel)\n".write(to: refineChoiceURL, atomically: true, encoding: .utf8)
+        }
+        NSLog("action: refine %@", refineEnabled ? "on" : "off")
+        updateRefineButton()
+        switch state {
+        case .preparing, .listening:
+            if !usesAnalyzer { restartEngine() }
+        case .paused, .ended, .problem:
+            break
+        }
+    }
+
+    // 已知的翻譯模型，依優先順序；選單只列出已下載的
+    private static let translationModels: [(name: String, label: String, detail: String)] = [
+        ("Hy-MT2-1.8B-8bit", "Hy-MT2 1.8B", "預設，快，譯文忠實簡潔"),
+        ("Hy-MT2-7B-4bit", "Hy-MT2 7B", "較準，每句多約 2 秒、多佔 2.1 GB 記憶體"),
+        ("Qwen3-4B-4bit", "Qwen3 4B", "通用聊天模型")
+    ]
+
+    private var translationChoiceURL: URL {
+        projectRoot().appendingPathComponent("Models/translation-model.txt")
+    }
+
+    private func translationInstalled(_ name: String) -> Bool {
+        FileManager.default.fileExists(atPath: projectRoot().appendingPathComponent("Models/\(name)/model.safetensors").path)
+    }
+
+    private var installedTranslations: [String] {
+        var names = Self.translationModels.map(\.name)
+        if let chosen = try? String(contentsOf: translationChoiceURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           !chosen.isEmpty, !names.contains(chosen) {
+            names.append(chosen)
+        }
+        return names.filter(translationInstalled)
+    }
+
+    // translation-model.txt 指定且已下載就用它，否則用清單裡第一個已下載的
+    private var preferredTranslation: String? {
+        if let chosen = try? String(contentsOf: translationChoiceURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+           !chosen.isEmpty, translationInstalled(chosen) {
+            return chosen
+        }
+        return installedTranslations.first
+    }
+
+    private func translationLabel(_ name: String) -> String {
+        Self.translationModels.first { $0.name == name }?.label ?? name
+    }
+
+    private func updateTranslationButton() {
+        let name = preferredTranslation ?? "未安裝"
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: NSColor.white.withAlphaComponent(0.55)
+        ]
+        translationButton.attributedTitle = NSAttributedString(string: translationLabel(name), attributes: attributes)
+        translationButton.toolTip = "翻譯模型：\(name)，點一下切換"
+    }
+
+    @objc private func showTranslationMenu() {
+        let menu = NSMenu()
+        let current = preferredTranslation
+        for name in installedTranslations {
+            let detail = Self.translationModels.first { $0.name == name }?.detail
+            let item = NSMenuItem(title: detail.map { "\(translationLabel(name))　\($0)" } ?? name, action: #selector(chooseTranslation(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = name
+            item.state = name == current ? .on : .off
+            menu.addItem(item)
+        }
+        // 字幕視窗在 screenSaver 層級，比選單高；選單打開期間暫時降下來，否則選單會被蓋住
+        let level = panel.level
+        panel.level = .floating
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: translationButton.bounds.height + 4), in: translationButton)
+        panel.level = level
+    }
+
+    @objc private func chooseTranslation(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String, name != preferredTranslation else { return }
+        NSLog("action: switch translation to %@", name)
+        try? "\(name)\n".write(to: translationChoiceURL, atomically: true, encoding: .utf8)
+        updateTranslationButton()
+        // 與切換辨識引擎相同：正在聽時立刻重啟，其他狀態下次開始時套用
+        switch state {
+        case .preparing, .listening:
+            restartEngine()
+        case .paused, .ended, .problem:
+            break
+        }
+    }
+
+    // 一開始就建立 Transcripts/<名稱>/ 資料夾，裡面放同名的逐字稿與錄音檔，之後邊聽邊寫入
+    private func openSession() {
+        let name = uniqueName(base: dateName())
+        let folder = transcriptsDirectory().appendingPathComponent(name)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let url = folder.appendingPathComponent("\(name).txt")
+        savedURL = url
+        writeTranscript(to: url, title: name)
+        recorder.open(at: folder.appendingPathComponent("\(name).wav"))
+    }
+
+    // 整段沒有任何字幕時，整個資料夾一併刪掉
+    private func closeSession() {
+        let empty = !hasContent
+        recorder.finish(deleteFile: empty)
+        if empty, let url = savedURL { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        savedURL = nil
+    }
+
+    private func renameSession(to name: String) {
+        guard let current = savedURL else { return }
+        let currentName = current.deletingPathExtension().lastPathComponent
+        guard !name.isEmpty, name != currentName else {
+            nameField.stringValue = currentName
+            updateNameWidth()
+            return
+        }
+        let finalName = uniqueName(base: name)
+        let oldFolder = current.deletingLastPathComponent()
+        let newFolder = transcriptsDirectory().appendingPathComponent(finalName)
+        // 先在原資料夾裡把兩個檔案改名，再改資料夾名
+        do {
+            try FileManager.default.moveItem(at: current, to: oldFolder.appendingPathComponent("\(finalName).txt"))
+        } catch {
+            NSLog("rename failed: %@", error.localizedDescription)
+            nameField.stringValue = currentName
+            updateNameWidth()
+            return
+        }
+        recorder.move(to: oldFolder.appendingPathComponent("\(finalName).wav"))
+        var folder = oldFolder
+        do {
+            try FileManager.default.moveItem(at: oldFolder, to: newFolder)
+            folder = newFolder
+        } catch {
+            NSLog("rename folder failed: %@", error.localizedDescription)
+        }
+        recorder.relocate(to: folder.appendingPathComponent("\(finalName).wav"))
+        let url = folder.appendingPathComponent("\(finalName).txt")
+        savedURL = url
+        refreshSavedFile()
+        nameField.stringValue = finalName
+        updateNameWidth()
+        statusLabel.toolTip = url.path
+        NSLog("renamed session to %@", finalName)
     }
 
     private func dateName() -> String {
@@ -629,7 +985,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func uniqueName(base: String) -> String {
         var name = base
         var index = 2
-        while FileManager.default.fileExists(atPath: transcriptsDirectory().appendingPathComponent("\(name).txt").path) {
+        while FileManager.default.fileExists(atPath: transcriptsDirectory().appendingPathComponent(name).path) {
             name = "\(base)-\(index)"
             index += 1
         }
@@ -657,9 +1013,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
-        let name = sanitizedName(nameField.stringValue)
-        nameField.stringValue = name.isEmpty ? nameBeforeEdit : name
-        updateNameWidth()
+        renameSession(to: sanitizedName(nameField.stringValue))
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -717,7 +1071,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         if case .ended = newState { ended = true }
         nameField.isHidden = !ended
         suffixLabel.isHidden = !ended
-        saveButton.isHidden = !ended
         endButton.isHidden = ended
         switch newState {
         case .preparing:
@@ -741,7 +1094,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         case .ended:
             spinner.stopAnimation(nil)
             setDot(NSColor.white.withAlphaComponent(0.35), pulse: false)
-            statusLabel.stringValue = savedURL == nil ? "已終止" : "已儲存"
+            statusLabel.stringValue = savedURL != nil && hasContent ? "已儲存" : "已終止"
             statusLabel.toolTip = savedURL?.path
             setSymbol(toggleButton, "play.fill", tip: "開始新的一段")
         case .problem(let message, let detail):
@@ -792,16 +1145,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         writeTranscript(to: url, title: url.deletingPathExtension().lastPathComponent)
     }
 
-    private func autosaveIfNeeded() {
-        guard hasContent else { return }
-        if let url = savedURL {
-            writeTranscript(to: url, title: url.deletingPathExtension().lastPathComponent)
-            return
-        }
-        let name = uniqueName(base: dateName())
-        writeTranscript(to: transcriptsDirectory().appendingPathComponent("\(name).txt"), title: name)
-    }
-
     private func renderTranscript() {
         guard let storage = transcriptView.textStorage else { return }
         let wasAtBottom = scrollView.documentVisibleRect.maxY >= transcriptView.bounds.height - 40
@@ -847,30 +1190,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         starting = true
         currentUtterance = 0
         if fresh {
+            closeSession()
             resetTranscript()
-            savedURL = nil
+            openSession()
         }
         setState(.preparing)
 
         let root = projectRoot()
-        let engineChoice = (try? String(contentsOf: root.appendingPathComponent("Models/speech-engine.txt"), encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if #available(macOS 26.0, *), engineChoice != "parakeet" {
-            usesAnalyzer = true
-        } else {
-            usesAnalyzer = false
-        }
+        usesAnalyzer = !prefersParakeet
+        activeRefine = refineEnabled
+        utteranceBase = entries.map(\.utterance).max() ?? 0
+        updateEngineButton()
         NSLog("speech engine: %@", usesAnalyzer ? "SpeechAnalyzer" : "parakeet")
         let python = root.appendingPathComponent(".venv/bin/python")
         let script = Bundle.main.resourceURL!.appendingPathComponent("worker.py")
-        let speech = root.appendingPathComponent("Models/parakeet-tdt_ctc-0.6b-ja")
-        var translationNames = ["Hy-MT2-1.8B-8bit", "Hunyuan-MT-7B-4bit", "Hy-MT2-1.8B-4bit", "Qwen3-4B-4bit"]
-        if let chosen = try? String(contentsOf: root.appendingPathComponent("Models/translation-model.txt"), encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines), !chosen.isEmpty {
-            translationNames.insert(chosen, at: 0)
-        }
-        let translation = translationNames.map { root.appendingPathComponent("Models/\($0)") }
-            .first { FileManager.default.fileExists(atPath: $0.appendingPathComponent("model.safetensors").path) }
+        let speech = root.appendingPathComponent(Self.parakeetJapanese)
+        activeTranslation = preferredTranslation ?? ""
+        updateTranslationButton()
+        let translation = preferredTranslation.map { root.appendingPathComponent("Models/\($0)") }
         guard FileManager.default.isExecutableFile(atPath: python.path),
               FileManager.default.fileExists(atPath: script.path),
               usesAnalyzer || FileManager.default.fileExists(atPath: speech.appendingPathComponent("model.safetensors").path),
@@ -882,7 +1219,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
         let process = Process()
         process.executableURL = python
-        let english = root.appendingPathComponent("Models/parakeet-tdt-0.6b-v3")
+        let english = root.appendingPathComponent(Self.parakeetEnglish)
         var arguments = usesAnalyzer ? [script.path, "--translate", translation.path] : [script.path, speech.path, translation.path]
         if !usesAnalyzer && FileManager.default.fileExists(atPath: english.appendingPathComponent("model.safetensors").path) {
             arguments.append(english.path)
@@ -952,6 +1289,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             let line = pendingOutput.prefix(upTo: newline)
             pendingOutput.removeSubrange(...newline)
             guard let event = try? JSONDecoder().decode(WorkerEvent.self, from: line) else { continue }
+            // parakeet 的 worker 每次啟動都從 1 編號；SpeechAnalyzer 模式送出時已加過 utteranceBase
+            let utterance = usesAnalyzer ? event.utterance : utteranceBase + event.utterance
             switch event.kind {
             case "status":
                 break
@@ -962,35 +1301,35 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                     beginCapture()
                 }
             case "partial_japanese":
-                guard event.utterance >= currentUtterance else { break }
-                currentUtterance = event.utterance
+                guard utterance >= currentUtterance else { break }
+                currentUtterance = utterance
                 liveJapanese = event.japanese
                 liveStable = event.stable ?? ""
                 renderTranscript()
                 if running { setState(.listening) }
             case "final_japanese":
-                entries.append(TranscriptEntry(utterance: event.utterance, time: clock.string(from: Date()), japanese: event.japanese, chinese: nil))
-                if event.utterance >= currentUtterance {
-                    currentUtterance = event.utterance + 1
+                entries.append(TranscriptEntry(utterance: utterance, time: clock.string(from: Date()), japanese: event.japanese, chinese: nil))
+                if utterance >= currentUtterance {
+                    currentUtterance = utterance + 1
                     liveJapanese = ""
                     liveStable = ""
                 }
                 renderTranscript()
                 refreshSavedFile()
             case "revised_japanese":
-                if let index = entries.lastIndex(where: { $0.utterance == event.utterance }) {
+                if let index = entries.lastIndex(where: { $0.utterance == utterance }) {
                     invalidateRendering(from: index)
                     entries[index].japanese = event.japanese
                     renderTranscript()
                     refreshSavedFile()
                 }
             case "final":
-                if let index = entries.lastIndex(where: { $0.utterance == event.utterance }) {
+                if let index = entries.lastIndex(where: { $0.utterance == utterance }) {
                     invalidateRendering(from: index)
                     entries[index].japanese = event.japanese
                     entries[index].chinese = event.chinese
                 } else {
-                    entries.append(TranscriptEntry(utterance: event.utterance, time: clock.string(from: Date()), japanese: event.japanese, chinese: event.chinese))
+                    entries.append(TranscriptEntry(utterance: utterance, time: clock.string(from: Date()), japanese: event.japanese, chinese: event.chinese))
                 }
                 renderTranscript()
                 refreshSavedFile()
@@ -1076,10 +1415,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func beginCapture() {
         guard starting, let sink else { return }
-        var onAudio: (Data) -> Void = { data in sink.write(data) }
+        let recorder = recorder
+        var onAudio: (Data) -> Void = { data in sink.write(data); recorder.append(data) }
         if #available(macOS 26.0, *), usesAnalyzer, let engine = engineBox as? SpeechEngine {
             let feeder = engine.feeder
-            onAudio = { data in feeder.append(data) }
+            onAudio = { data in feeder.append(data); recorder.append(data) }
         }
         let capture = AudioCapture(onAudio: onAudio, onError: { [weak self] message in
             DispatchQueue.main.async { self?.setState(.problem("系統音訊中斷", message)) }
@@ -1091,6 +1431,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 guard self.starting else { await capture.stop(); return }
                 self.starting = false
                 self.running = true
+                self.recorder.resume()
                 self.setState(.listening)
             } catch {
                 self.starting = false

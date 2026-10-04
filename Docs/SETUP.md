@@ -204,17 +204,28 @@ macOS 26 上第一次啟動時，SpeechAnalyzer 會向 Apple 下載日文與英�
 
 ## 8. 操作與逐字稿
 
-底部列由左到右：狀態燈、狀態文字、檔名欄、儲存、終止、暫停／繼續。
+底部列由左到右：狀態燈、狀態文字、辨識引擎（Apple／parakeet）、檔名欄（終止後出現）、終止、暫停／繼續。
+
+開始一段時就自動建立一個資料夾，逐字稿與錄音放在裡面，三者同名，邊聽邊寫入，不必另外按儲存或錄音：
+
+```text
+Transcripts/2026-10-02/
+├── 2026-10-02.txt
+└── 2026-10-02.wav
+```
 
 | 操作 | 效果 |
 |---|---|
-| 暫停／繼續 | 暫停只停止聆聽，繼續接著同一段記 |
-| 終止 | 結束這一段，檔名欄出現預設檔名（當天日期），點檔名可原地修改 |
-| 儲存 | 寫入 `Transcripts/<檔名>.txt`；同名已存在時自動加流水號 |
-| 終止後再按播放 | 清空畫面開始新的一段；尚未儲存時先確認 |
-| 關閉視窗或 Cmd+Q | 有未儲存內容時用預設檔名自動存一份 |
+| 暫停／繼續 | 暫停只停止聆聽與錄音，繼續接著同一段記 |
+| 終止 | 結束這一段，檔名欄出現目前檔名；點檔名修改後按 Enter，資料夾、逐字稿、錄音一起改名 |
+| 終止後再按播放 | 清空畫面開始新的一段，另建一個新資料夾 |
+| 關閉視窗或 Cmd+Q | 寫入最後一次內容後結束 |
 
-逐字稿位置：`${REPO_ROOT}/Transcripts/`（不進 Git）。每句兩行，先日文再中文；App 關閉時仍在辨識中的句子標「（未定稿）」：
+命名規則：同名資料夾已存在時自動加流水號（`2026-10-02-2`）。整段沒有任何字幕時，整個資料夾在下一段開始或 App 結束時刪除。
+
+錄音格式為 16 kHz、單聲道、16-bit WAV，約每小時 115 MB。暫停期間不錄，所以錄音長度會比會議實際時間短。
+
+逐字稿位置：`${REPO_ROOT}/Transcripts/<名稱>/`（不進 Git）。每句兩行，先日文再中文；App 關閉時仍在辨識中的句子標「（未定稿）」：
 
 ```
 [15:53:34] 必ず誰かを選んでもらうみたいな形にした方がいいですかね。
@@ -225,23 +236,38 @@ macOS 26 上第一次啟動時，SpeechAnalyzer 會向 Apple 下載日文與英�
 
 ### 辨識引擎
 
-macOS 26 以上預設用 SpeechAnalyzer。要改回 parakeet：先依第 4 節設定 `LIVE_TRANSLATOR_PARAKEET=1` 下載 parakeet 模型，再寫入設定檔並重開 App。
+macOS 26 以上預設用 SpeechAnalyzer。兩種引擎都會自動辨別日文與英文。parakeet 模式用 `parakeet-tdt_ctc-0.6b-ja` 辨識日文、`parakeet-tdt-0.6b-v3` 辨識英文，兩個都解一次後挑分數高的。
+
+切換方式：點字幕視窗底列狀態文字右邊的「Apple」或「parakeet」。正在聽時會立刻重啟辨識，已有的字幕保留；暫停或已終止時只記下選擇，下次開始時套用。選擇寫在 `Models/speech-engine.txt`（內容為 `parakeet`；檔案不存在就是 SpeechAnalyzer），重開 App 後仍有效。
+
+切到 parakeet 前要先有模型，沒有的話 App 會跳提示。下載方式：
 
 ```bash
-echo "parakeet" > "${REPO_ROOT}/Models/speech-engine.txt"
+cd "${REPO_ROOT}"
+LIVE_TRANSLATOR_PARAKEET=1 .venv/bin/python Scripts/download_models.py
 ```
 
-改回 SpeechAnalyzer：刪掉 `Models/speech-engine.txt`。`Logs/app.log` 每次啟動會記一行 `speech engine: SpeechAnalyzer` 或 `speech engine: parakeet`。
+正在聽時切換，切換當下還在翻譯的那一句不會有中文。`Logs/app.log` 每次啟動會記一行 `speech engine: SpeechAnalyzer` 或 `speech engine: parakeet`。
 
 ### 翻譯模型
 
-在 `Models/translation-model.txt` 寫入 `Models/` 下的目錄名，重開 App 即生效。沒有這個檔案時依 `Hy-MT2-1.8B-8bit`、`Hunyuan-MT-7B-4bit`、`Hy-MT2-1.8B-4bit`、`Qwen3-4B-4bit` 的順序用第一個已下載的（[LiveTranslator.swift:867](../App/LiveTranslator.swift#L867)）。
+點字幕視窗底列辨識引擎右邊的模型名稱（例如「Hy-MT2 1.8B」），從選單選擇。選單只列出 `Models/` 下已下載的模型。正在聽時會立刻重啟，已有的字幕保留，但切換當下還在翻譯的那一句不會有中文；暫停或已終止時下次開始才套用。
+
+| 模型 | 大小 | 特性 |
+|---|---|---|
+| `Hy-MT2-1.8B-8bit` | 1.8 GB | 預設。譯文忠實簡潔，每句 0.5～1.9 秒 |
+| `Hy-MT2-7B-4bit` | 4.0 GB | 比 1.8B 準，每句多約 2 秒、記憶體多 2.1 GB |
+| `Qwen3-4B-4bit` | 2.1 GB | 通用聊天模型，用系統提示詞要求日譯中 |
+
+選擇寫在 `Models/translation-model.txt`，重開 App 後仍有效。沒有這個檔案，或指定的模型不在時，依上表順序用第一個已下載的（[LiveTranslator.swift](../App/LiveTranslator.swift) 的 `translationModels`）。
+
+`Scripts/download_models.py` 只下載 `Hy-MT2-1.8B-8bit`，另外兩個要自己下載：
 
 ```bash
-echo "Hy-MT2-7B-4bit" > "${REPO_ROOT}/Models/translation-model.txt"
+cd "${REPO_ROOT}"
+.venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('mlx-community/Hy-MT2-7B-4bit', local_dir='Models/Hy-MT2-7B-4bit')"
+.venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('mlx-community/Qwen3-4B-4bit', local_dir='Models/Qwen3-4B-4bit')"
 ```
-
-Hy-MT2-7B 4-bit（mlx-community/Hy-MT2-7B-4bit，4.0 GB）翻得比 1.8B 準，代價是每句多約 2 秒、權重多 2.1 GB。
 
 ### 選用：定稿後用 Qwen3-ASR 重新辨識
 
@@ -251,10 +277,9 @@ Hy-MT2-7B 4-bit（mlx-community/Hy-MT2-7B-4bit，4.0 GB）翻得比 1.8B 準，�
 cd "${REPO_ROOT}"
 uv pip install --python .venv/bin/python "mlx-audio[stt]"
 .venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('mlx-community/Qwen3-ASR-1.7B-8bit', local_dir='Models/Qwen3-ASR-1.7B-8bit')"
-echo "Qwen3-ASR-1.7B-8bit" > Models/final-model.txt
 ```
 
-關閉：刪掉 `Models/final-model.txt`。
+下載後，在 parakeet 模式下點底列的「Qwen 重解：關／開」切換（Apple 模式下不顯示）。正在聽時會立刻重啟套用，暫停時下次繼續才套用。設定寫在 `Models/final-model.txt`（內容為模型目錄名；檔案不存在就是關閉）。
 
 ## 10. 問題排除
 
