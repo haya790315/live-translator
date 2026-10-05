@@ -70,9 +70,64 @@ final class AudioResampler {
     }
 }
 
+// 自動增益：把會議語音拉到約 -23 dBFS，VAD 與辨識模型才拿到穩定的音量。只放大不衰減，尾端軟限幅避免削波。
+// 實測（2026-10-05 迴路測試）擷取路徑固定少 6 dB，真實會議語音落在 -22 到 -34 dBFS。
+final class AudioLeveler {
+    private let target: Float = -23      // dBFS
+    private let gate: Float = -50        // 低於此視為無聲，不更新音量估計
+    private let maxGain: Float = 24      // dB
+    private let attack = 0.15            // 秒：音量變大時收增益的速度
+    private let release = 2.5            // 秒：音量變小時放增益的速度，慢一點才不會把停頓時的底噪抬上來
+    private(set) var level: Float = -29  // 估計的語音 RMS（dBFS）；起始值對應 +6 dB，先補回路徑損失
+    private(set) var gain: Float = 6     // dB
+
+    private static let ceiling: Float = 0.7  // -3 dBFS：峰值蓋與軟限幅的門檻
+    private static let rampSamples = 80      // 5 ms：增益漸變的長度
+
+    func process(_ samples: inout [Float]) {
+        guard !samples.isEmpty else { return }
+        var sum: Float = 0
+        var peak: Float = 0
+        for sample in samples {
+            sum += sample * sample
+            peak = max(peak, abs(sample))
+        }
+        let db = 20 * log10(max(sqrt(sum / Float(samples.count)), 1e-9))
+        if db > gate {
+            let tau = db > level ? attack : release
+            let alpha = Float(1 - exp(-Double(samples.count) / 16000 / tau))
+            level += (db - level) * alpha
+        }
+        let previous = gain
+        gain = min(max(target - level, 0), maxGain)
+        // 峰值蓋：突然變大聲（換人講話）時慢速 AGC 來不及收，這裡即時把增益壓到峰值不超過 -3 dBFS
+        if peak > 0 {
+            gain = min(gain, max(20 * log10(Self.ceiling / peak), 0))
+        }
+        // 5 ms 線性漸變到新增益，避免拉鍊聲；之後整塊用新增益
+        let start = pow(10, previous / 20)
+        let end = pow(10, gain / 20)
+        let ramp = min(Self.rampSamples, samples.count)
+        for index in 0..<samples.count {
+            let factor = index < ramp ? start + (end - start) * Float(index) / Float(ramp) : end
+            samples[index] = Self.limit(samples[index] * factor)
+        }
+    }
+
+    // 軟限幅（安全網）：-3 dBFS 以上用 tanh 壓縮，峰值不會到 0 dBFS
+    private static func limit(_ value: Float) -> Float {
+        let magnitude = abs(value)
+        guard magnitude > ceiling else { return value }
+        let compressed = ceiling + (1 - ceiling) * tanh((magnitude - ceiling) / (1 - ceiling))
+        return value < 0 ? -compressed : compressed
+    }
+}
+
 final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private let queue = DispatchQueue(label: "LiveTranslator.Audio")
     private let resampler = AudioResampler()
+    private let leveler = AudioLeveler()
+    private var samplesSinceLog = 0
     private let onAudio: (Data) -> Void
     private let onError: (String) -> Void
     private var stream: SCStream?
@@ -158,24 +213,22 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         guard status == noErr else { return }
         let buffers = Array(UnsafeMutableAudioBufferListPointer(list))
         let channels = Int(format.mChannelsPerFrame)
-        if buffers.count == 1, channels == 1, format.mSampleRate == 16000,
-           let pointer = buffers[0].mData, buffers[0].mDataByteSize > 0 {
-            onAudio(Data(bytes: pointer, count: Int(buffers[0].mDataByteSize)))
-        } else if buffers.count == 1, let pointer = buffers[0].mData {
+        var mono = [Float]()
+        if buffers.count == 1, let pointer = buffers[0].mData {
             let frames = Int(buffers[0].mDataByteSize) / (MemoryLayout<Float>.size * channels)
             let values = pointer.assumingMemoryBound(to: Float.self)
-            var mono = [Float]()
             mono.reserveCapacity(frames)
-            for frame in 0..<frames {
-                var sum: Float = 0
-                for channel in 0..<channels { sum += values[frame * channels + channel] }
-                mono.append(sum / Float(channels))
+            if channels == 1 {
+                mono.append(contentsOf: UnsafeBufferPointer(start: values, count: frames))
+            } else {
+                for frame in 0..<frames {
+                    var sum: Float = 0
+                    for channel in 0..<channels { sum += values[frame * channels + channel] }
+                    mono.append(sum / Float(channels))
+                }
             }
-            let data = resampler.convert(mono, sampleRate: format.mSampleRate)
-            if !data.isEmpty { onAudio(data) }
         } else if buffers.count >= channels {
             let frames = buffers.prefix(channels).map { Int($0.mDataByteSize) / MemoryLayout<Float>.size }.min() ?? 0
-            var mono = [Float]()
             mono.reserveCapacity(frames)
             for frame in 0..<frames {
                 var sum: Float = 0
@@ -185,10 +238,29 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 mono.append(sum / Float(channels))
             }
-            let data = resampler.convert(mono, sampleRate: format.mSampleRate)
-            if !data.isEmpty { onAudio(data) }
         }
         withExtendedLifetime(block) {}
+        guard !mono.isEmpty else { return }
+        deliver(mono, sampleRate: format.mSampleRate)
+    }
+
+    // 統一轉成 16 kHz 單聲道 float32，過自動增益後送出；每 60 秒記一次原始音量與增益
+    private func deliver(_ mono: [Float], sampleRate: Double) {
+        var samples: [Float]
+        if sampleRate == 16000 {
+            samples = mono
+        } else {
+            let data = resampler.convert(mono, sampleRate: sampleRate)
+            samples = data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        }
+        guard !samples.isEmpty else { return }
+        leveler.process(&samples)
+        samplesSinceLog += samples.count
+        if samplesSinceLog >= 16000 * 60 {
+            samplesSinceLog = 0
+            NSLog("audio level: speech %.1f dBFS, gain %+.1f dB", leveler.level, leveler.gain)
+        }
+        onAudio(samples.withUnsafeBytes { Data($0) })
     }
 }
 

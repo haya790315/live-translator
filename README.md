@@ -43,7 +43,7 @@ Hy-MT2-1.8B 中文翻譯（MLX，帶前兩句上下文；潤稿開啟時另帶�
 ## 目錄與檔案
 
 ```text
-App/LiveTranslator.swift          macOS 原生 App：ScreenCaptureKit 擷取系統音訊、浮動字幕視窗、啟動 Python worker、儲存逐字稿
+App/LiveTranslator.swift          macOS 原生 App：ScreenCaptureKit 擷取系統音訊、自動增益、浮動字幕視窗、啟動 Python worker、儲存逐字稿
 App/SpeechEngine.swift            SpeechAnalyzer 辨識：日英兩個轉錄器、切句定稿、挑語言、正式定稿後的修正
 App/Info.plist                    App 設定與螢幕錄製權限說明
 App/AppIcon.icns                  App 圖示
@@ -54,6 +54,7 @@ Scripts/make_segment_data.py      下載 BSD 語料並合成「句子講完／�
 Scripts/train_segmenter.py        訓練字尾 n-gram 斷句分類器，輸出 Models/segmenter/weights.json
 Scripts/build.sh                  編譯並簽章 Build/LiveTranslator.app（改了程式後重跑）
 Scripts/make_signing_identity.sh  選用：建立本機自簽憑證，重編後不必重新授權
+Scripts/audio_qc.py               檢查錄音的音量、頻寬、斷音，判斷辨識錯誤是不是音訊本身的問題
 Docs/SETUP.md                     開發環境建置、模型下載、啟動、操作與問題排除
 Docs/V1_PLAN.md                   設計紀錄、量測結果與已知風險
 mise.toml                         指定 Python 3.12
