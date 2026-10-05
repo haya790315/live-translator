@@ -114,6 +114,14 @@ POLISH_MIN_LENGTH = 0.6
 POLISH_LINE = re.compile(r"润稿\s*[:：]\s*(.*)")
 LATIN_WORD = re.compile(r"[A-Za-z]+")
 PARTICLE_START = re.compile(r"^[とがをにはも](?=[^\x00-\x7f])")
+
+# 規則刪贅詞：只刪沒有歧義的語氣詞，不經過模型。「あの」只刪句首且後面接假名或頓號的（「あの件」不碰）；
+# 「なんか」「まあ」有語意，不碰。英文另外合併「we can, we can」這種兩個字以上的重講
+JA_FILLER = re.compile(r"(?:えーっと|えっとー|えっと|えーと|ええと|えーっ|えー|あのー|あのう|うーん|んー)[、，]?")
+JA_LEADING_ANO = re.compile(r"^あの(?=[、，぀-ゟ])")
+EN_FILLER = re.compile(r"\b(?:um+|uh+|uhm+|erm?|hmm+)\b", re.IGNORECASE)
+EN_REPEAT = re.compile(r"\b((\w+)(?:\s+\w+){1,3}),?\s+\1\b", re.IGNORECASE)
+MEANINGFUL = re.compile(r"[぀-ヿ一-鿿A-Za-z0-9]")
 POLISH_SYSTEM_PROMPT = """你是会议逐字稿的校对员。对【本句】做最小限度的修正，输出与输入同一种语言，绝不翻译。
 只允许做这四件事：
 1. 删掉填充词（えー、あの、えっと、um、uh）和说错后重说的重复片段
@@ -552,11 +560,46 @@ def plausible_term(wrong, right):
     return a is None or b is None or a == b
 
 
+def remove_fillers(text, language):
+    if language == "en":
+        cleaned = EN_FILLER.sub("", text)
+        cleaned = EN_REPEAT.sub(r"\1", cleaned)
+        cleaned = re.sub(r"\s*,(?:\s*,)+", ",", cleaned)
+        cleaned = re.sub(r"\s+([,.?!])", r"\1", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" ,")
+        if cleaned and text[:1].isupper() and cleaned[0].islower():
+            cleaned = cleaned[0].upper() + cleaned[1:]
+    else:
+        cleaned = JA_FILLER.sub("", text)
+        cleaned = JA_LEADING_ANO.sub("", cleaned)
+        cleaned = re.sub(r"[、，]{2,}", "、", cleaned).lstrip("、，")
+    return cleaned if MEANINGFUL.search(cleaned) else text
+
+
 class Glossary:
-    """聽錯寫法 → 正確寫法。只收錄能在原始文字裡找到、開頭發音同類的對照，套用時不經過模型。"""
+    """聽錯寫法 → 正確寫法，套用時不經過模型。
+    靜態條目來自 Models/glossary.txt（使用者維護，不淘汰）；潤稿開啟時模型從會議中學到的條目要能在原始文字裡找到、
+    開頭發音同類才收錄，最舊的先淘汰。"""
 
     def __init__(self):
         self.entries = {}
+        self.pinned = set()
+        self.extra = []
+
+    # 檔案格式：一行一條，「聽錯寫法=正確寫法」會替換；只寫「正確寫法」則只給翻譯與辨識參考；# 開頭是註解
+    def load(self, path):
+        with open(path, encoding="utf-8") as handle:
+            for raw in handle:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    wrong, right = (part.strip() for part in line.split("=", 1))
+                    if wrong and right and wrong != right:
+                        self.entries[wrong] = right
+                        self.pinned.add(wrong)
+                elif line not in self.extra:
+                    self.extra.append(line)
 
     def add(self, wrong, right, evidence):
         wrong, right = wrong.strip().strip("「」『』\"'"), right.strip().strip("「」『』\"'")
@@ -567,8 +610,11 @@ class Glossary:
             return False
         if wrong.lower() not in evidence.lower() or wrong in self.entries or not plausible_term(wrong, right):
             return False
-        if len(self.entries) >= GLOSSARY_LIMIT:
-            del self.entries[next(iter(self.entries))]
+        if len(self.entries) - len(self.pinned) >= GLOSSARY_LIMIT:
+            oldest = next((key for key in self.entries if key not in self.pinned), None)
+            if oldest is None:
+                return False
+            del self.entries[oldest]
         self.entries[wrong] = right
         return True
 
@@ -582,11 +628,18 @@ class Glossary:
                     continue
                 text = re.sub(rf"(?<![A-Za-z]){re.escape(wrong)}(?![A-Za-z])", right, text, flags=re.IGNORECASE)
             else:
-                text = text.replace(wrong, right)
+                # 片假名換成英文後若緊鄰另一個英文字（ショピファイトLINE），補空白，翻譯才不會把兩個名字黏成一個
+                def replace(match, right=right):
+                    before = match.string[match.start() - 1] if match.start() > 0 else ""
+                    after = match.string[match.end()] if match.end() < len(match.string) else ""
+                    lead = " " if LATIN.match(before) and LATIN.match(right) else ""
+                    trail = " " if LATIN.match(after) and LATIN.search(right[-1:]) else ""
+                    return lead + right + trail
+                text = re.sub(re.escape(wrong), replace, text)
         return text
 
     def terms(self):
-        return list(dict.fromkeys(self.entries.values()))
+        return list(dict.fromkeys(self.extra + list(self.entries.values())))
 
     def describe(self):
         grouped = {}
@@ -755,10 +808,16 @@ class Polisher:
 
 
 class Translator:
-    def __init__(self, model, tokenizer, model_type="", refiner=None, name="", polisher=None):
+    def __init__(self, model, tokenizer, model_type="", refiner=None, name="", polisher=None, glossary_path=None):
         self.refiner = refiner
         self.polisher = polisher
         self.glossary = Glossary()
+        if glossary_path:
+            try:
+                self.glossary.load(glossary_path)
+            except OSError as exc:
+                note(f"glossary load failed: {exc}")
+            note(f"glossary: {len(self.glossary.entries)} replacements, {len(self.glossary.terms())} terms from {glossary_path}")
         self.topic = ""
         self.recent = []
         self.since_memory = 0
@@ -916,14 +975,14 @@ class Translator:
             return
         note(f"memory {elapsed:.2f}s {outcome} topic={self.topic!r} added={added}")
 
-    # 翻譯前：套術語表（純字串替換，不經過模型）
-    def _apply_glossary(self, utterance, text, language):
+    # 翻譯前：規則刪贅詞、套術語表（都是純字串處理，不經過模型）
+    def _preprocess(self, utterance, text, language):
         self.recent = (self.recent + [text])[-MEMORY_WINDOW:]
         self.since_memory += 1
-        applied = self.glossary.apply(text, language)
-        if applied != text:
-            emit("revised_japanese", utterance, applied)
-        return applied
+        cleaned = self.glossary.apply(remove_fillers(text, language), language)
+        if cleaned != text:
+            emit("revised_japanese", utterance, cleaned)
+        return cleaned
 
     # 翻譯後：LLM 潤稿。只在佇列空著時跑，新句子一到就中止，所以中文不會因為它變慢
     def _polish(self, utterance, text, language):
@@ -968,7 +1027,7 @@ class Translator:
                 if chosen != japanese:
                     emit("revised_japanese", utterance, chosen)
                     japanese = chosen
-            japanese = self._apply_glossary(utterance, japanese, language)
+            japanese = self._preprocess(utterance, japanese, language)
             started = time.monotonic()
             chinese = []
             if self.context_aware:
@@ -1014,6 +1073,12 @@ def optional_model_path(models_dir, env_name, file_name):
     return path if os.path.isdir(path) else None
 
 
+# 術語表檔案：環境變數優先，否則 Models/glossary.txt；不存在就沒有靜態術語
+def glossary_path(models_dir):
+    path = os.environ.get("LIVE_TRANSLATOR_GLOSSARY") or os.path.join(models_dir, "glossary.txt")
+    return path if os.path.isfile(path) else None
+
+
 # 潤稿模型和翻譯模型相同時共用一份權重
 def load_polisher(path, translation_path, translation_model):
     if path is None:
@@ -1038,7 +1103,7 @@ def translate_only(translation_path):
         model_type = json.load(handle).get("model_type", "")
     model, tokenizer = load(translation_path)
     polisher = load_polisher(optional_model_path(models_dir, "LIVE_TRANSLATOR_POLISH_MODEL", "polish-model.txt"), translation_path, (model, tokenizer))
-    translator = Translator(model, tokenizer, model_type=model_type, name=os.path.basename(os.path.normpath(translation_path)), polisher=polisher)
+    translator = Translator(model, tokenizer, model_type=model_type, name=os.path.basename(os.path.normpath(translation_path)), polisher=polisher, glossary_path=glossary_path(models_dir))
     debug(f"translate-only style={translator.style}")
     emit("ready", message="就緒")
     for line in sys.stdin:
@@ -1094,7 +1159,7 @@ def main():
     debug(f"refiner: {refiner_path if refiner else None}")
     model, tokenizer = load(translation_path)
     polisher = load_polisher(polish_path, translation_path, (model, tokenizer))
-    translator = Translator(model, tokenizer, model_type=model_type, refiner=refiner, name=os.path.basename(os.path.normpath(translation_path)), polisher=polisher)
+    translator = Translator(model, tokenizer, model_type=model_type, refiner=refiner, name=os.path.basename(os.path.normpath(translation_path)), polisher=polisher, glossary_path=glossary_path(models_dir))
     debug(f"translator style={translator.style} prefix_cached={translator.prefix_tokens is not None}")
     emit("ready", message="就緒")
 

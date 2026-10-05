@@ -277,6 +277,24 @@ cd "${REPO_ROOT}"
 .venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('mlx-community/Qwen3-4B-4bit', local_dir='Models/Qwen3-4B-4bit')"
 ```
 
+### 術語表與刪贅詞（預設開啟）
+
+每句定稿後、翻譯前，worker 先做兩件不經過模型的處理，結果直接替換字幕與逐字稿上的原文：
+
+1. 規則刪贅詞：刪掉 えっと、えーと、えー、あのー、うーん、句首接假名或頓號的 あの（「あの件」不碰）、英文的 um／uh，合併「we can, we can」這種兩個字以上的重講。「なんか」「まあ」有語意，不碰。
+2. 術語表替換：`Models/glossary.txt`，一行一條，自己維護（Models/ 不進 Git）：
+
+```text
+ショピファイト=Shopify      # 翻譯前直接把左邊換成右邊；英文不分大小寫、以字為單位，片假名直接比對
+sopifi=Shopify
+line=LINE                  # 只差大小寫的對照只套在日文句子上；英文句子裡的 line 多半是普通單字
+Figma                      # 單獨一行：不替換，只給翻譯提示與 Apple 辨識參考
+```
+
+術語表的正確寫法會一併放進翻譯提示（「译文中原样保留这些名词」）；Apple 模式下還會當作 SpeechAnalyzer 的 contextual strings，讓辨識在第一次就偏向這些詞。改完存檔，下次開始聆聽時生效（終止後再開始，或切換引擎／模型；暫停再繼續不會重讀）。開啟潤稿時，模型從會議中學到的術語加在這份之上，不會淘汰檔案裡的條目。
+
+worker 啟動時在 `Logs/app.log` 記 `glossary: N replacements, M terms`，Apple 模式另記 `glossary: M contextual strings`。
+
 ### 選用：定稿後用 Qwen3-ASR 重新辨識
 
 只在 parakeet 模式有效，預設關閉。開啟後每句定稿時把該句音訊交給 Qwen3-ASR-1.7B 重解一次，能把含糊發音校正成通順的字，代價是每句多 1～2 秒、權重多 2.5 GB，16 GB 機器容易 swap。

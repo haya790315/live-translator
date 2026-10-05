@@ -919,6 +919,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
+    // Models/glossary.txt 的正確寫法（「聽錯=正確」取等號右邊，單獨一行的整行採用），worker 讀同一個檔做替換與翻譯提示
+    private func glossaryTerms() -> [String] {
+        let url = projectRoot().appendingPathComponent("Models/glossary.txt")
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+        var terms: [String] = []
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty, !line.hasPrefix("#") else { continue }
+            let term = (line.split(separator: "=", maxSplits: 1).last.map(String.init) ?? line).trimmingCharacters(in: .whitespaces)
+            if !term.isEmpty, !terms.contains(term) { terms.append(term) }
+        }
+        return terms
+    }
+
     private static let polishModel = "Qwen3-4B-4bit"
 
     private var polishChoiceURL: URL {
@@ -1499,6 +1513,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         guard starting, let sink else { return }
         let engine = SpeechEngine()
         engineBox = engine
+        engine.contextualStrings = glossaryTerms()
+        NSLog("glossary: %d contextual strings", engine.contextualStrings.count)
         utteranceBase = entries.map(\.utterance).max() ?? 0
         engine.onPartial = { [weak self] text in self?.analyzerPartial(text) }
         engine.onFinal = { [weak self] id, text, language in self?.analyzerFinal(id: id, text: text, language: language, sink: sink) }

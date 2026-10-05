@@ -113,6 +113,8 @@ final class SpeechEngine {
     var onFinal: (Int, String, String) -> Void = { _, _, _ in }
     var onRevise: (Int, String) -> Void = { _, _ in }
     var onError: (String) -> Void = { _ in }
+    // 術語表裡的正確寫法，給 SpeechAnalyzer 當 contextual strings，讓辨識在第一次就偏向這些詞；prepare() 之前設定
+    var contextualStrings: [String] = []
 
     nonisolated let feeder = AudioFeeder()
     private var analyzer: SpeechAnalyzer?
@@ -170,6 +172,11 @@ final class SpeechEngine {
         feeder.configure(target: format, continuation: continuation)
         let analyzer = SpeechAnalyzer(modules: modules, options: SpeechAnalyzer.Options(priority: .userInitiated, modelRetention: .processLifetime))
         self.analyzer = analyzer
+        if !contextualStrings.isEmpty {
+            let context = AnalysisContext()
+            context.contextualStrings[.general] = contextualStrings
+            try await analyzer.setContext(context)
+        }
         try await analyzer.prepareToAnalyze(in: format)
         try await analyzer.start(inputSequence: stream)
         ticker = Task { [weak self] in

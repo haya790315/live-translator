@@ -5,13 +5,13 @@
 ```text
 macOS 系統音訊（ScreenCaptureKit）
         ↓
-Apple SpeechAnalyzer 日文與英文轉錄器同時辨識，依結果挑語言（macOS 內建，本機執行）
+Apple SpeechAnalyzer 日文與英文轉錄器同時辨識，依結果挑語言（macOS 內建，本機執行；術語表作為 contextual strings）
         ↓
-（選用）術語表替換：把這場會議學到的聽錯寫法換成正確寫法
+規則刪贅詞（えっと、えー、um…）＋ 術語表替換（Models/glossary.txt）
         ↓
-Hy-MT2-1.8B 中文翻譯（MLX，帶前兩句上下文；潤稿開啟時另帶會議主題與術語表）
+Hy-MT2-1.8B 中文翻譯（MLX，帶前兩句上下文與術語表）
         ↓
-（選用）Qwen3-4B 在空檔替原文刪贅詞、補標點，只准刪不准改，完成後替換原文
+（選用）Qwen3-4B 在空檔補標點、學會議中的術語與主題；16 GB 機器開會時不建議開
         ↓
 浮動字幕視窗、Transcripts/*.txt
 ```
@@ -58,7 +58,7 @@ Scripts/audio_qc.py               檢查錄音的音量、頻寬、斷音，判�
 Docs/SETUP.md                     開發環境建置、模型下載、啟動、操作與問題排除
 Docs/V1_PLAN.md                   設計紀錄、量測結果與已知風險
 mise.toml                         指定 Python 3.12
-Models/                           本地模型與訓練產物（內容不進 Git）
+Models/                           本地模型、訓練產物與 glossary.txt 術語表（內容不進 Git）
 Build/、Transcripts/、Logs/        編譯產物、逐字稿、執行紀錄（皆不進 Git）
 ```
 
