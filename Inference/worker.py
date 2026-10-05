@@ -560,8 +560,10 @@ class Glossary:
 
     def add(self, wrong, right, evidence):
         wrong, right = wrong.strip().strip("「」『』\"'"), right.strip().strip("「」『』\"'")
-        # 正確寫法至少兩個字：模型拿不準時會亂猜一個字母（ヒグマ=H）
+        # 正確寫法至少兩個字：模型拿不準時會亂猜一個字母（ヒグマ=H）；也擋掉「あと=あと（无）」這種把「无」填進欄位的輸出
         if len(wrong) < 2 or len(right) < 2 or len(right) > 30 or "=" in right or wrong == right:
+            return False
+        if re.search(r"[（()）]|无|無", right) or right.startswith(wrong) or wrong.startswith(right):
             return False
         if wrong.lower() not in evidence.lower() or wrong in self.entries or not plausible_term(wrong, right):
             return False
