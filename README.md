@@ -1,26 +1,28 @@
 # Live Translator
 
-在 Apple Silicon Mac 上完全本地執行的即時字幕工具：擷取 Mac 正在播放的系統音訊，辨識日文與英文（自動辨別，不需切換），翻成簡體中文，顯示在可拖移的浮動視窗，並可把逐字稿存成文字檔。音訊與文字不離開這台機器。
+在 Apple Silicon Mac 上完全本地執行的即時字幕工具：擷取 Mac 正在播放的系統音訊，辨識日文與英文（自動辨別，不需切換），顯示在可拖移的浮動視窗，並把逐字稿存成文字檔。音訊與文字不離開這台機器。
+
+macOS 26 以上的預設模式（Apple）目前只做日英逐字稿、不翻譯，把記憶體與 GPU 留給定稿重解以求最高準確度：
 
 ```text
 macOS 系統音訊（ScreenCaptureKit）
         ↓
-Apple SpeechAnalyzer 日文與英文轉錄器同時辨識，依結果挑語言（macOS 內建，本機執行；術語表作為 contextual strings）
+Apple SpeechAnalyzer 日文與英文轉錄器同時辨識，即時顯示初稿並切句（macOS 內建；術語表作為 contextual strings）
+        ↓
+每句定稿後，Qwen3-ASR-1.7B 指定日文重解該句音訊（MLX；英文照原文輸出；1.5 秒以下的日文短句沿用初稿）
         ↓
 規則刪贅詞（えっと、えー、um…）＋ 術語表替換（Models/glossary.txt）
         ↓
-Hy-MT2-1.8B 中文翻譯（MLX，帶前兩句上下文與術語表）
-        ↓
-（選用）Qwen3-4B 在空檔補標點、學會議中的術語與主題；16 GB 機器開會時不建議開
-        ↓
 浮動字幕視窗、Transcripts/*.txt
 ```
+
+parakeet 模式（macOS 14～25，或手動切換）仍會用 Hy-MT2-1.8B 翻成簡體中文，可選用 Qwen3-4B 潤稿。
 
 已在真實線上會議中使用。設計取捨、量測結果與已知風險見 [Docs/V1_PLAN.md](Docs/V1_PLAN.md)。
 
 ## 安裝與啟動
 
-需要 macOS 26 以上的 Apple Silicon Mac、16 GB 記憶體、5 GB 磁碟，以及 Xcode Command Line Tools、Homebrew、`mise`、`uv`。macOS 14 到 25 改用 parakeet 辨識，安裝時會多下載 4.6 GB 模型。
+需要 macOS 26 以上的 Apple Silicon Mac、16 GB 記憶體、8 GB 磁碟，以及 Xcode Command Line Tools、Homebrew、`mise`、`uv`。macOS 14 到 25 改用 parakeet 辨識，安裝時會多下載 4.6 GB 模型。
 
 1. 取得原始碼
 
@@ -29,7 +31,7 @@ Hy-MT2-1.8B 中文翻譯（MLX，帶前兩句上下文與術語表）
    cd live-translator
    ```
 
-2. 一鍵安裝：建立 Python 環境、下載翻譯模型 1.8 GB、訓練斷句分類器、編譯 App
+2. 一鍵安裝：建立 Python 環境、下載辨識重解模型 2.3 GB 與翻譯模型 1.8 GB、訓練斷句分類器、編譯 App
 
    ```bash
    zsh Scripts/setup.sh
@@ -47,7 +49,7 @@ App/LiveTranslator.swift          macOS 原生 App：ScreenCaptureKit 擷取系�
 App/SpeechEngine.swift            SpeechAnalyzer 辨識：日英兩個轉錄器、切句定稿、挑語言、正式定稿後的修正
 App/Info.plist                    App 設定與螢幕錄製權限說明
 App/AppIcon.icns                  App 圖示
-Inference/worker.py               推論 worker：Hy-MT2 翻譯；選用的 Qwen3-4B 潤稿與會議記憶；parakeet 模式下另負責 VAD 與辨識；以 JSON 行與 App 溝通
+Inference/worker.py               推論 worker：Apple 模式下用 Qwen3-ASR 重解每句；parakeet 模式下 Hy-MT2 翻譯、選用的 Qwen3-4B 潤稿與會議記憶；parakeet 模式下另負責 VAD 與辨識；以 JSON 行與 App 溝通
 Scripts/setup.sh                  一鍵安裝：建 venv、裝套件、下載模型、訓練斷句分類器、編譯 App
 Scripts/download_models.py        從 Hugging Face 下載模型到 Models/
 Scripts/make_segment_data.py      下載 BSD 語料並合成「句子講完／沒講完」訓練資料

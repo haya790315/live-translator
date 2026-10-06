@@ -1,6 +1,8 @@
+import base64
 import difflib
 import json
 import os
+import queue
 import re
 import sys
 import threading
@@ -509,6 +511,13 @@ class Refiner:
         if language == "ja":
             text = CJK_SPACE.sub("", text)
         return text, language
+
+    # 一律指定日文：自動判斷時日英夾雜的音訊會被翻成英文、日文句子整句消失；指定日文時英文照原文輸出
+    def transcribe_japanese(self, samples):
+        with gpu_lock:
+            output = self.model.generate(samples, max_tokens=MAX_REFINE_TOKENS, language="Japanese")
+        text = output.text.strip()
+        return CJK_SPACE.sub("", text) if JAPANESE.search(text) else text
 
 
 def overlap(sentence, original):
@@ -1121,7 +1130,108 @@ def translate_only(translation_path):
     return 0
 
 
+# SpeechAnalyzer 在很短的日文句子上通常是對的，時間戳卻常偏移，重解反而會吃進前後句；這種句子沿用原文。
+# 判成英文的短句仍要重解：多半是日文被誤判成英文的亂碼（It's my feet.）
+MIN_REFINE_SECONDS = 1.5
+# App 切片時前後各多留的秒數（LiveTranslator.swift 的 refineLeadSeconds + refineTailSeconds）
+REFINE_PADDING_SECONDS = 0.2
+
+# 重解的切片會混進上一句的尾巴：新結果開頭與上一句結尾重複 MIN_REPEAT_CHARS 字以上就切掉（比對時忽略標點與空白）
+MIN_REPEAT_CHARS = 4
+
+
+def strip_repeated_head(text, previous):
+    head = MATCH_STRIP.sub("", text).lower()
+    tail = MATCH_STRIP.sub("", previous).lower()
+    size = next((k for k in range(min(len(head), len(tail)), MIN_REPEAT_CHARS - 1, -1) if tail.endswith(head[:k])), 0)
+    if size == 0 or size == len(head):
+        return text
+    seen = 0
+    for index, char in enumerate(text):
+        if not MATCH_STRIP.match(char):
+            seen += 1
+            if seen == size:
+                return text[index + 1:].lstrip("。、，,.！？!? ")
+    return text
+
+
+class Finalizer:
+    """SpeechAnalyzer 模式只做逐字稿：每句用 Qwen3-ASR 重解該句音訊，再刪贅詞、套術語表，送出 final（中文留空）。
+    沒有重解模型或沒收到音訊時直接用 SpeechAnalyzer 的文字。"""
+
+    def __init__(self, refiner, glossary_path):
+        self.refiner = refiner
+        self.glossary = Glossary()
+        if glossary_path:
+            try:
+                self.glossary.load(glossary_path)
+            except OSError as exc:
+                note(f"glossary load failed: {exc}")
+            note(f"glossary: {len(self.glossary.entries)} replacements from {glossary_path}")
+        self.previous = ""
+        self.jobs = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def submit(self, utterance, text, language, audio):
+        self.jobs.put((utterance, text, language, audio))
+
+    def close(self):
+        self.jobs.put(None)
+        self.thread.join()
+
+    def _refine(self, utterance, text, audio):
+        samples = np.frombuffer(audio, dtype="<f4").copy()
+        started = time.monotonic()
+        try:
+            refined = self.refiner.transcribe_japanese(samples)
+        except Exception as exc:
+            note(f"refine failed utterance={utterance}: {exc}")
+            return text
+        chosen = strip_repeated_head(choose_final(text, refined, language_of(refined)), self.previous) if refined else text
+        note(f"refine utterance={utterance} {time.monotonic() - started:.2f}s audio={len(samples) / SAMPLE_RATE:.2f}s {text!r} -> {refined!r}{'' if chosen == refined else f' (chose {chosen!r})'}")
+        return chosen
+
+    def _run(self):
+        while True:
+            job = self.jobs.get()
+            if job is None:
+                return
+            utterance, text, language, audio = job
+            short = len(audio) < (MIN_REFINE_SECONDS + REFINE_PADDING_SECONDS) * BYTES_PER_SECOND
+            if self.refiner is not None and audio and not (short and language == "ja"):
+                text = self._refine(utterance, text, audio)
+                language = language_of(text)
+            self.previous = text
+            emit("final", utterance, self.glossary.apply(remove_fillers(text, language), language), "")
+
+
+def transcribe_only(models_dir, refiner_path):
+    emit("status", message="準備中")
+    refiner = Refiner(refiner_path) if refiner_path and os.path.isdir(refiner_path) else None
+    note(f"transcribe-only refiner={refiner_path if refiner else None}")
+    finalizer = Finalizer(refiner, glossary_path(models_dir))
+    emit("ready", message="就緒")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            job = json.loads(line)
+        except ValueError:
+            continue
+        text = str(job.get("text", "")).strip()
+        if text:
+            audio = base64.b64decode(job["audio"]) if job.get("audio") else b""
+            finalizer.submit(int(job.get("utterance", 0)), text, job.get("language") or language_of(text), audio)
+    finalizer.close()
+    return 0
+
+
 def main():
+    # --transcribe <Models 目錄> [Qwen3-ASR 路徑]：SpeechAnalyzer 模式，只做逐字稿不翻譯
+    if len(sys.argv) in (3, 4) and sys.argv[1] == "--transcribe":
+        return transcribe_only(sys.argv[2], sys.argv[3] if len(sys.argv) == 4 else None)
     if len(sys.argv) == 3 and sys.argv[1] == "--translate":
         return translate_only(sys.argv[2])
     if len(sys.argv) not in (3, 4):

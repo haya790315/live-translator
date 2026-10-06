@@ -783,8 +783,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func resume() {
         NSLog("action: resume")
-        guard worker?.isRunning == true, sink != nil, usesAnalyzer != prefersParakeet, activeTranslation == (preferredTranslation ?? ""),
-              activePolish == polishEnabled, usesAnalyzer || activeRefine == refineEnabled else {
+        // Apple 模式只做逐字稿，翻譯與潤稿的設定不影響它
+        guard worker?.isRunning == true, sink != nil, usesAnalyzer != prefersParakeet, activeRefine == refineEnabled,
+              usesAnalyzer || (activeTranslation == (preferredTranslation ?? "") && activePolish == polishEnabled) else {
             start(fresh: false)
             return
         }
@@ -817,6 +818,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         engineButton.toolTip = parakeet
             ? "語音辨識：parakeet（日文、英文），點一下切換成 Apple SpeechAnalyzer"
             : "語音辨識：Apple SpeechAnalyzer（日文、英文），點一下切換成 parakeet"
+        // Apple 模式只做逐字稿，不翻譯也不潤稿
+        polishButton?.isHidden = !parakeet
+        translationButton?.isHidden = !parakeet
         updateRefineButton()
     }
 
@@ -879,17 +883,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func updateRefineButton() {
-        // 只有 parakeet 模式會重新辨識，Apple 模式下隱藏
-        refineButton.isHidden = !prefersParakeet
         let on = refineEnabled
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: .medium),
             .foregroundColor: on ? NSColor(srgbRed: 1.0, green: 0.85, blue: 0.42, alpha: 1.0) : NSColor.white.withAlphaComponent(0.3)
         ]
         refineButton.attributedTitle = NSAttributedString(string: on ? "Qwen 重解：開" : "Qwen 重解：關", attributes: attributes)
+        let effect = prefersParakeet ? "較準但中文晚 1～2 秒" : "較準但定稿晚約 1 秒"
         refineButton.toolTip = on
-            ? "每句定稿後用 Qwen3-ASR 重新辨識，較準但中文晚 1～2 秒、多佔 2.5 GB 記憶體。點一下關閉"
-            : "點一下開啟：每句定稿後用 Qwen3-ASR 重新辨識，較準但中文晚 1～2 秒、多佔 2.5 GB 記憶體"
+            ? "每句定稿後用 Qwen3-ASR 重新辨識，\(effect)、多佔 2.5 GB 記憶體。點一下關閉"
+            : "點一下開啟：每句定稿後用 Qwen3-ASR 重新辨識，\(effect)、多佔 2.5 GB 記憶體"
     }
 
     @objc private func toggleRefine() {
@@ -913,7 +916,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         updatePolishButton()
         switch state {
         case .preparing, .listening:
-            if !usesAnalyzer { restartEngine() }
+            restartEngine()
         case .paused, .ended, .problem:
             break
         }
@@ -1363,7 +1366,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         guard FileManager.default.isExecutableFile(atPath: python.path),
               FileManager.default.fileExists(atPath: script.path),
               usesAnalyzer || FileManager.default.fileExists(atPath: speech.appendingPathComponent("model.safetensors").path),
-              let translation else {
+              usesAnalyzer || translation != nil else {
             starting = false
             setState(.problem("尚未完成安裝", "請先在專案目錄執行 Scripts/setup.sh"))
             return
@@ -1372,9 +1375,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let process = Process()
         process.executableURL = python
         let english = root.appendingPathComponent(Self.parakeetEnglish)
-        var arguments = usesAnalyzer ? [script.path, "--translate", translation.path] : [script.path, speech.path, translation.path]
-        if !usesAnalyzer && FileManager.default.fileExists(atPath: english.appendingPathComponent("model.safetensors").path) {
-            arguments.append(english.path)
+        var arguments: [String]
+        if usesAnalyzer {
+            // Apple 模式只做逐字稿：worker 不載入翻譯模型，Qwen 重解開著時才帶模型路徑
+            arguments = [script.path, "--transcribe", root.appendingPathComponent("Models").path]
+            if activeRefine { arguments.append(root.appendingPathComponent("Models/\(Self.refineModel)").path) }
+        } else {
+            arguments = [script.path, speech.path, translation!.path]
+            if FileManager.default.fileExists(atPath: english.appendingPathComponent("model.safetensors").path) {
+                arguments.append(english.path)
+            }
         }
         process.arguments = arguments
         process.environment = ProcessInfo.processInfo.environment.merging([
@@ -1517,7 +1527,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         NSLog("glossary: %d contextual strings", engine.contextualStrings.count)
         utteranceBase = entries.map(\.utterance).max() ?? 0
         engine.onPartial = { [weak self] text in self?.analyzerPartial(text) }
-        engine.onFinal = { [weak self] id, text, language in self?.analyzerFinal(id: id, text: text, language: language, sink: sink) }
+        engine.onFinal = { [weak self] id, text, language, start, end in
+            self?.analyzerFinal(id: id, text: text, language: language, start: start, end: end, sink: sink)
+        }
         engine.onRevise = { [weak self] id, text in self?.analyzerRevise(id: id, text: text, sink: sink) }
         engine.onError = { [weak self] message in
             NSLog("speech engine error: %@", message)
@@ -1544,30 +1556,42 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         if running { setState(.listening) }
     }
 
-    // language 是 ja 或 en；沒給時 worker 自己從文字判斷
-    private func sendForTranslation(utterance: Int, text: String, language: String? = nil, sink: AudioSink) {
+    // language 是 ja 或 en；沒給時 worker 自己從文字判斷。audio 是該句的 16 kHz float32 音訊，給 Qwen 重解
+    private func sendToWorker(utterance: Int, text: String, language: String? = nil, audio: Data? = nil, sink: AudioSink) {
         var job: [String: Any] = ["utterance": utterance, "text": text]
         if let language { job["language"] = language }
+        if let audio, !audio.isEmpty { job["audio"] = audio.base64EncodedString() }
         guard let line = try? JSONSerialization.data(withJSONObject: job) else { return }
         sink.write(line + Data([10]))
     }
 
-    private func analyzerFinal(id: Int, text: String, language: String, sink: AudioSink) {
+    // 重解時前後多留一點音訊：SpeechAnalyzer 的時間戳常把句首、句尾的音切掉一些。
+    // 留太多會吃進前後句：兩段真實會議實測 0.2/0.3 秒有 12 句混入下一句，0.1/0.1 秒 7 句。worker 的 REFINE_PADDING_SECONDS 要同步
+    private static let refineLeadSeconds = 0.1
+    private static let refineTailSeconds = 0.1
+
+    private func analyzerFinal(id: Int, text: String, language: String, start: Double, end: Double, sink: AudioSink) {
         let utterance = utteranceBase + id
         entries.append(TranscriptEntry(utterance: utterance, time: clock.string(from: Date()), japanese: text, chinese: nil))
         renderTranscript()
         refreshSavedFile()
-        sendForTranslation(utterance: utterance, text: text, language: language, sink: sink)
+        var audio: Data?
+        if #available(macOS 26.0, *), activeRefine, let engine = engineBox as? SpeechEngine {
+            audio = engine.feeder.audio(from: start - Self.refineLeadSeconds, to: end + Self.refineTailSeconds)
+        }
+        sendToWorker(utterance: utterance, text: text, language: language, audio: audio, sink: sink)
     }
 
+    // SpeechAnalyzer 事後修正已送出的句子。Qwen 重解開著時以重解結果為準：已定稿就不動，未定稿只更新畫面
     private func analyzerRevise(id: Int, text: String, sink: AudioSink) {
         let utterance = utteranceBase + id
         guard let index = entries.lastIndex(where: { $0.utterance == utterance }) else { return }
+        if activeRefine && entries[index].chinese != nil { return }
         invalidateRendering(from: index)
         entries[index].japanese = text
         renderTranscript()
         refreshSavedFile()
-        sendForTranslation(utterance: utterance, text: text, sink: sink)
+        if !activeRefine { sendToWorker(utterance: utterance, text: text, sink: sink) }
     }
 
     private func beginCapture() {

@@ -12,11 +12,27 @@ final class AudioFeeder: @unchecked Sendable {
     private var converter: AVAudioConverter?
     private var continuation: AsyncStream<AnalyzerInput>.Continuation?
     private var frames: Int64 = 0
+    // 最近送進辨識的 16 kHz float32 音訊，定稿後切出該句交給 Qwen3-ASR 重解；時間軸與 SpeechAnalyzer 的 audioTimeRange 相同
+    private var history = Data()
+    private var historyStart: Int64 = 0
+    private static let historyFrames: Int64 = 16000 * 120
+    private static let trimFrames: Int64 = 16000 * 30
 
     var seconds: Double {
         lock.lock()
         defer { lock.unlock() }
         return Double(frames) / 16000
+    }
+
+    // from、to 是秒；超出保留範圍的部分會被截掉
+    func audio(from: Double, to: Double) -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        let first = max(Int64(from * 16000), historyStart)
+        let last = min(Int64(to * 16000), frames)
+        guard last > first else { return Data() }
+        let size = MemoryLayout<Float>.size
+        return history.subdata(in: Int(first - historyStart) * size..<Int(last - historyStart) * size)
     }
 
     func configure(target: AVAudioFormat, continuation: AsyncStream<AnalyzerInput>.Continuation) {
@@ -69,6 +85,13 @@ final class AudioFeeder: @unchecked Sendable {
         continuation.yield(AnalyzerInput(buffer: input))
         lock.lock()
         frames += Int64(count)
+        history.append(data)
+        // 每次只砍掉一整段，避免每個 buffer 都搬移整份資料
+        if frames - historyStart > Self.historyFrames + Self.trimFrames {
+            history.removeSubrange(0..<Int(Self.trimFrames) * MemoryLayout<Float>.size)
+            history = Data(history)
+            historyStart += Self.trimFrames
+        }
         lock.unlock()
     }
 }
@@ -92,6 +115,8 @@ final class SpeechEngine {
         var parts: [String] = []
         var terminated = 0
         var rangeEnd = 0.0
+        // 這個 chunk 裡已逐句定稿的最後一句結尾；定稿的句子會離開 queue，不能靠 queue.last 找前一句
+        var lastEnd = 0.0
         var seen: [String: (Date, Double)] = [:]
         var queue: [Item] = []
     }
@@ -110,7 +135,8 @@ final class SpeechEngine {
     static let fillers: Set<String> = ["オー", "おー", "えっと", "えーと", "ええと", "えー", "え", "あー", "あ", "あの", "あのー", "うーん", "うん", "ん", "んー", "まあ", "um", "uh", "uhm", "umm", "hmm", "hm", "mm", "mhm", "er", "ah", "oh", "huh"]
 
     var onPartial: (String) -> Void = { _ in }
-    var onFinal: (Int, String, String) -> Void = { _, _, _ in }
+    // id、文字、語言、在 feeder 時間軸上的起訖秒數
+    var onFinal: (Int, String, String, Double, Double) -> Void = { _, _, _, _, _ in }
     var onRevise: (Int, String) -> Void = { _, _ in }
     var onError: (String) -> Void = { _ in }
     // 術語表裡的正確寫法，給 SpeechAnalyzer 當 contextual strings，讓辨識在第一次就偏向這些詞；prepare() 之前設定
@@ -219,6 +245,7 @@ final class SpeechEngine {
             lane.open = true
             lane.chunk += 1
             lane.chunkStart = start
+            lane.lastEnd = start
             lane.committed = 0
             lane.seen = [:]
         }
@@ -242,7 +269,7 @@ final class SpeechEngine {
                 }
             }
             let spans = Self.spans(timed, language: language)
-            var itemStart = lane.queue.last.map { max($0.end, start) } ?? start
+            var itemStart = max(lane.committed > 0 ? lane.lastEnd : (lane.queue.last?.end ?? start), start)
             for index in lane.committed..<max(lane.committed, lane.parts.count) {
                 let span = index < spans.count && spans.count == lane.parts.count ? spans[index] : (itemStart, end)
                 lane.queue.append(Item(text: lane.parts[index], start: span.0, end: span.1, queued: Date(), key: "\(language)|\(lane.chunk)|\(index)"))
@@ -274,8 +301,9 @@ final class SpeechEngine {
             let age = now.timeIntervalSince(first)
             let followed = lane.committed + 1 < lane.parts.count
             guard finishing || age >= (followed ? Self.settleSeconds : Self.lonelySettleSeconds) else { break }
-            let itemStart = lane.committed == 0 ? lane.chunkStart : (lane.queue.last?.end ?? lane.chunkStart)
+            let itemStart = lane.committed == 0 ? lane.chunkStart : lane.lastEnd
             lane.queue.append(Item(text: sentence, start: max(itemStart, lane.chunkStart), end: end, queued: now, key: "\(language)|\(lane.chunk)|\(lane.committed)"))
+            lane.lastEnd = max(lane.lastEnd, end)
             lane.committed += 1
         }
         lanes[language] = lane
@@ -347,7 +375,7 @@ final class SpeechEngine {
         nextId += 1
         emitted[item.key] = (id, item.text)
         if debug { print("  emit \(id) \(language): \(item.text)") }
-        onFinal(id, item.text, language)
+        onFinal(id, item.text, language, item.start, item.end)
     }
 
     private func publishPartial() {

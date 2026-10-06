@@ -97,11 +97,12 @@ arm64 0.32.3
 
 ## 4. 下載模型
 
-模型放在 `Models/` 下，目錄名固定，App 依目錄名尋找。辨識在 macOS 26 上由系統內建的 SpeechAnalyzer 負責，不需要下載模型；腳本在 macOS 26 以上只下載翻譯模型與 VAD，14 到 25 另外下載兩個 parakeet。
+模型放在 `Models/` 下，目錄名固定，App 依目錄名尋找。macOS 26 上的即時辨識由系統內建的 SpeechAnalyzer 負責，每句定稿再交給 Qwen3-ASR 重解；腳本一律下載 Qwen3-ASR、翻譯模型與 VAD，14 到 25 另外下載兩個 parakeet。macOS 26 以上第一次下載時會順便寫入 `Models/final-model.txt`，讓「Qwen 重解」預設開啟。
 
 | 目錄（`Models/` 下） | 用途 | 大小 | 何時下載 | 來源 | 授權 |
 |---|---|---:|---|---|---|
-| `Hy-MT2-1.8B-8bit` | 中文翻譯 | 1.8 GB | 一律 | mlx-community/Hy-MT2-1.8B-8bit | Apache-2.0 |
+| `Qwen3-ASR-1.7B-8bit` | 每句定稿後重解（Apple 模式預設開啟） | 2.3 GB | 一律 | mlx-community/Qwen3-ASR-1.7B-8bit | Apache-2.0 |
+| `Hy-MT2-1.8B-8bit` | 中文翻譯，parakeet 模式用 | 1.8 GB | 一律 | mlx-community/Hy-MT2-1.8B-8bit | Apache-2.0 |
 | `silero-vad/model.onnx` | 語音活動偵測，parakeet 模式用 | 2 MB | 一律 | onnx-community/silero-vad | MIT |
 | `parakeet-tdt_ctc-0.6b-ja` | 日文辨識，parakeet 模式用 | 2.3 GB | macOS 25 以下 | mlx-community/parakeet-tdt_ctc-0.6b-ja | CC-BY-4.0 |
 | `parakeet-tdt-0.6b-v3` | 英文辨識，parakeet 模式用 | 2.3 GB | macOS 25 以下 | mlx-community/parakeet-tdt-0.6b-v3 | CC-BY-4.0 |
@@ -125,6 +126,7 @@ ls "${REPO_ROOT}"/Models/*/model.safetensors "${REPO_ROOT}/Models/silero-vad/mod
 
 ```
 .../Models/Hy-MT2-1.8B-8bit/model.safetensors
+.../Models/Qwen3-ASR-1.7B-8bit/model.safetensors
 .../Models/silero-vad/model.onnx
 ```
 
@@ -204,7 +206,9 @@ macOS 26 上第一次啟動時，SpeechAnalyzer 會向 Apple 下載日文與英�
 
 ## 8. 操作與逐字稿
 
-底部列由左到右：狀態燈、狀態文字、辨識引擎（Apple／parakeet）、Qwen 重解（只在 parakeet 模式顯示）、潤稿、翻譯模型、檔名欄（終止後出現）、終止、暫停／繼續。
+底部列由左到右：狀態燈、狀態文字、辨識引擎（Apple／parakeet）、Qwen 重解、潤稿與翻譯模型（只在 parakeet 模式顯示）、檔名欄（終止後出現）、終止、暫停／繼續。
+
+Apple 模式只做日英逐字稿、不翻譯。字幕先出現 SpeechAnalyzer 的初稿，每句講完約 1～2.5 秒後換成 Qwen3-ASR 的定稿。
 
 開始一段時就自動建立一個資料夾，逐字稿與錄音放在裡面，三者同名，邊聽邊寫入，不必另外按儲存或錄音：
 
@@ -295,9 +299,14 @@ Figma                      # 單獨一行：不替換，只給翻譯提示與 Ap
 
 worker 啟動時在 `Logs/app.log` 記 `glossary: N replacements, M terms`，Apple 模式另記 `glossary: M contextual strings`。
 
-### 選用：定稿後用 Qwen3-ASR 重新辨識
+### Qwen 重解（Apple 模式預設開啟）
 
-只在 parakeet 模式有效，預設關閉。開啟後每句定稿時把該句音訊交給 Qwen3-ASR-1.7B 重解一次，能把含糊發音校正成通順的字，代價是每句多 1～2 秒、權重多 2.5 GB，16 GB 機器容易 swap。
+每句定稿時把該句音訊交給 Qwen3-ASR-1.7B（8-bit）重解一次，結果取代 SpeechAnalyzer 的文字。
+
+- **Apple 模式**：worker 不載入翻譯模型，只有 Qwen3-ASR（峰值約 3.6 GB）。一律指定日文解碼：自動判斷語言時，日英夾雜的音訊會被翻成英文；指定日文時英文照原文輸出。1.5 秒以下的日文短句沿用 SpeechAnalyzer 的文字。每句約多等 1～2.5 秒。
+- **parakeet 模式**：和翻譯模型同時常駐，權重多 2.5 GB，中文晚 1～2 秒，16 GB 機器容易 swap，預設關閉。
+
+`Scripts/download_models.py` 會下載模型；舊環境要自己補：
 
 ```bash
 cd "${REPO_ROOT}"
@@ -305,11 +314,11 @@ uv pip install --python .venv/bin/python "mlx-audio[stt]"
 .venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('mlx-community/Qwen3-ASR-1.7B-8bit', local_dir='Models/Qwen3-ASR-1.7B-8bit')"
 ```
 
-下載後，在 parakeet 模式下點底列的「Qwen 重解：關／開」切換（Apple 模式下不顯示）。正在聽時會立刻重啟套用，暫停時下次繼續才套用。設定寫在 `Models/final-model.txt`（內容為模型目錄名；檔案不存在就是關閉）。
+點底列的「Qwen 重解：關／開」切換。正在聽時會立刻重啟套用，暫停時下次繼續才套用。設定寫在 `Models/final-model.txt`（內容為模型目錄名；檔案不存在就是關閉）。`Logs/app.log` 每句記一行 `refine utterance=… 秒數 audio=… 原文 -> 重解結果`，可以拿來對照。
 
 ### 選用：定稿後先潤稿再翻譯
 
-兩種辨識引擎都適用，預設關閉。開啟後每句定稿時：
+只在 parakeet 模式有效（Apple 模式不翻譯，按鈕隱藏），預設關閉。開啟後每句定稿時：
 
 1. 翻譯前套用術語表：把這場會議中學到的聽錯寫法換成正確寫法（`ショピファイト`→`Shopify`、`sopifi`→`Shopify`），純字串替換，不經過模型
 2. 翻譯時 Hy-MT2 的提示詞多帶會議主題與術語表
@@ -317,7 +326,7 @@ uv pip install --python .venv/bin/python "mlx-audio[stt]"
 
 術語表和會議主題由 Qwen3-4B 在翻譯佇列空著時從最近 8 句原始文字抽出來，每 6 句或閒置 3 秒更新一次。聽錯寫法必須真的出現在逐字稿裡、正確寫法至少兩個字、兩者開頭子音同類（`ショピファイト`→`Shopify` 可以，`ショピファイト`→`LINE` 不行）才收錄。
 
-代價：權重多 2.1 GB。Apple 模式下 worker 共約 4 GB，parakeet 模式下共約 6.4 GB，16 GB 機器開著瀏覽器就會 swap、整體變慢，潤稿會大量超時。和「Qwen 重解」互斥，開一個另一個自動關。
+代價：權重多 2.1 GB，parakeet 模式下 worker 共約 6.4 GB，16 GB 機器開著瀏覽器就會 swap、整體變慢，潤稿會大量超時。和「Qwen 重解」互斥，開一個另一個自動關。
 
 模型與第 9 節翻譯模型清單裡的 `Qwen3-4B-4bit` 是同一份，翻譯模型也選它時共用權重：
 
