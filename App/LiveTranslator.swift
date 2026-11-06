@@ -267,10 +267,16 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
 struct WorkerEvent: Decodable {
     let kind: String
     let utterance: Int
-    var japanese: String
-    let chinese: String
+    let text: String
+    let translation: String
     let message: String
-    let stable: String?
+    // warning 的種類：translator_load、refine_load、polish_load、translate_failed、finalize_failed
+    let code: String?
+}
+
+// 每個 worker 各自一份：切換時舊 worker 還在收尾，兩邊的輸出不能混在同一個緩衝裡
+final class OutputBuffer {
+    var data = Data()
 }
 
 final class AudioSink {
@@ -416,8 +422,14 @@ enum PanelState {
 struct TranscriptEntry {
     let utterance: Int
     let time: String
-    var japanese: String
-    var chinese: String?
+    var text: String
+    var translation: String?
+    // worker 已送回定稿（Qwen 重解、刪贅詞、術語表都處理完）；之後 SpeechAnalyzer 的修正不再覆蓋
+    var finalized = false
+    // SpeechAnalyzer 判定的語言（ja 或 en）；修正後重送 worker 時要帶上，worker 才不用從文字猜
+    var language: String?
+    // 這句屬於第幾個 worker；worker 結束時用來把它沒送回定稿的句子標成已定稿
+    var generation = 0
 }
 
 @MainActor
@@ -432,13 +444,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var transcriptView: NSTextView!
     private var toggleButton: NSButton!
     private var endButton: NSButton!
-    private var engineButton: NSButton!
     private var translationButton: NSButton!
     private var refineButton: NSButton!
-    private var polishButton: NSButton!
     private var activeRefine = false
+    private var polishButton: NSButton!
     private var activePolish = false
+    // 潤稿模型載入失敗（worker 回報 polish_load）：按鈕顯示「載入失敗」，原因放 tooltip；重新開始聆聽時清掉
+    private var polishFailed = false
+    private var polishNotice = ""
     private var activeTranslation = ""
+    private var activeTarget = ""
+    private var workerNotice = ""
+    private var translateNotice = ""
+    private var translatorFailed = false
+    private var switching = false
+    private var switchToken = 0
+    private var workerGeneration = 0
     private let recorder = AudioRecorder()
     private var nameField: NSTextField!
     private var nameWidth: NSLayoutConstraint!
@@ -451,18 +472,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var sink: AudioSink?
     private var outputPipe: Pipe?
     private var errorPipe: Pipe?
-    private var pendingOutput = Data()
     private var workerError = ""
     private var capture: AudioCapture?
     private var starting = false
     private var running = false
-    private var currentUtterance = 0
     private var entries: [TranscriptEntry] = []
     private var committedCount = 0
     private var committedLength = 0
-    private var liveJapanese = ""
+    private var liveText = ""
     private var liveStable = ""
-    private var usesAnalyzer = false
     private var engineBox: AnyObject?
     private var utteranceBase = 0
     private let clock: DateFormatter = {
@@ -470,31 +488,32 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         formatter.dateFormat = "HH:mm:ss"
         return formatter
     }()
-    private let japaneseAttributes: [NSAttributedString.Key: Any]
-    private let japaneseAloneAttributes: [NSAttributedString.Key: Any]
+    private let textAttributes: [NSAttributedString.Key: Any]
+    private let textAloneAttributes: [NSAttributedString.Key: Any]
     private let liveAttributes: [NSAttributedString.Key: Any]
     private let tentativeAttributes: [NSAttributedString.Key: Any]
-    private let chineseAttributes: [NSAttributedString.Key: Any]
+    private let translationAttributes: [NSAttributedString.Key: Any]
 
     override init() {
-        let japaneseFont = NSFont.systemFont(ofSize: 14)
+        let textFont = NSFont.systemFont(ofSize: 14)
         let liveFont = NSFont.systemFont(ofSize: 16)
-        let chineseFont = NSFont.systemFont(ofSize: 18, weight: .semibold)
-        let chineseColor = NSColor(red: 1.0, green: 0.85, blue: 0.42, alpha: 1.0)
+        let translationFont = NSFont.systemFont(ofSize: 18, weight: .semibold)
+        let translationColor = NSColor(red: 1.0, green: 0.85, blue: 0.42, alpha: 1.0)
         let tightStyle = NSMutableParagraphStyle()
         tightStyle.paragraphSpacing = 2
         let looseStyle = NSMutableParagraphStyle()
         looseStyle.paragraphSpacing = 18
-        japaneseAttributes = [.font: japaneseFont, .foregroundColor: NSColor.white.withAlphaComponent(0.62), .paragraphStyle: tightStyle]
-        japaneseAloneAttributes = [.font: japaneseFont, .foregroundColor: NSColor.white.withAlphaComponent(0.62), .paragraphStyle: looseStyle]
+        textAttributes = [.font: textFont, .foregroundColor: NSColor.white.withAlphaComponent(0.62), .paragraphStyle: tightStyle]
+        textAloneAttributes = [.font: textFont, .foregroundColor: NSColor.white.withAlphaComponent(0.62), .paragraphStyle: looseStyle]
         liveAttributes = [.font: liveFont, .foregroundColor: NSColor.white.withAlphaComponent(0.92), .paragraphStyle: looseStyle]
         tentativeAttributes = [.font: liveFont, .foregroundColor: NSColor.white.withAlphaComponent(0.45), .paragraphStyle: looseStyle]
-        chineseAttributes = [.font: chineseFont, .foregroundColor: chineseColor, .paragraphStyle: looseStyle]
+        translationAttributes = [.font: translationFont, .foregroundColor: translationColor, .paragraphStyle: looseStyle]
         super.init()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         installCrashLogging(root: projectRoot())
+        migrateLegacySettings()
         makePanel()
         NSApp.activate(ignoringOtherApps: true)
         start(fresh: true)
@@ -521,6 +540,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     func windowWillClose(_ notification: Notification) {
         NSLog("windowWillClose")
         NSApp.terminate(nil)
+    }
+
+    // 舊版的 Models/polish-model.txt（重解開關）改名為 final-model.txt：舊設定自動打開重解，檔案刪掉
+    private func migrateLegacySettings() {
+        let models = projectRoot().appendingPathComponent("Models")
+        let legacy = models.appendingPathComponent("polish-model.txt")
+        guard FileManager.default.fileExists(atPath: legacy.path) else { return }
+        let hasModel = FileManager.default.fileExists(atPath: models.appendingPathComponent(Self.refineModel).path)
+        if !FileManager.default.fileExists(atPath: refineChoiceURL.path), hasModel {
+            try? "\(Self.refineModel)\n".write(to: refineChoiceURL, atomically: true, encoding: .utf8)
+            NSLog("migrate: polish-model.txt -> final-model.txt (%@), polish-model.txt removed", Self.refineModel)
+        } else {
+            NSLog("migrate: polish-model.txt removed (final-model.txt exists or %@ missing)", Self.refineModel)
+        }
+        try? FileManager.default.removeItem(at: legacy)
     }
 
     private func makeLabel(size: CGFloat, color: NSColor, weight: NSFont.Weight = .regular, lines: Int = 2) -> NSTextField {
@@ -594,20 +628,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         suffixLabel = NSTextField(labelWithString: ".txt")
         suffixLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         suffixLabel.textColor = NSColor.white.withAlphaComponent(0.45)
-        engineButton = NSButton(title: "", target: self, action: #selector(switchEngine))
-        engineButton.isBordered = false
-        engineButton.bezelStyle = .regularSquare
-        engineButton.translatesAutoresizingMaskIntoConstraints = false
-        if #unavailable(macOS 26.0) { engineButton.isHidden = true }
         refineButton = NSButton(title: "", target: self, action: #selector(toggleRefine))
         refineButton.isBordered = false
         refineButton.bezelStyle = .regularSquare
         refineButton.translatesAutoresizingMaskIntoConstraints = false
+        updateRefineButton()
         polishButton = NSButton(title: "", target: self, action: #selector(togglePolish))
         polishButton.isBordered = false
         polishButton.bezelStyle = .regularSquare
         polishButton.translatesAutoresizingMaskIntoConstraints = false
-        updateEngineButton()
         updatePolishButton()
         translationButton = NSButton(title: "", target: self, action: #selector(showTranslationMenu))
         translationButton.isBordered = false
@@ -619,12 +648,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         indicator.translatesAutoresizingMaskIntoConstraints = false
         indicator.addSubview(statusDot)
         indicator.addSubview(spinner)
-        let top = NSStackView(views: [indicator, statusLabel, engineButton, refineButton, polishButton, translationButton, nameField, suffixLabel, endButton, toggleButton])
+        let top = NSStackView(views: [indicator, statusLabel, refineButton, polishButton, translationButton, nameField, suffixLabel, endButton, toggleButton])
         top.orientation = .horizontal
         top.alignment = .centerY
         top.distribution = .fill
         top.spacing = 8
-        top.setCustomSpacing(10, after: engineButton)
         top.setCustomSpacing(10, after: refineButton)
         top.setCustomSpacing(10, after: polishButton)
         top.setCustomSpacing(12, after: translationButton)
@@ -635,8 +663,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         toggleButton.setContentHuggingPriority(.required, for: .horizontal)
         endButton.setContentHuggingPriority(.required, for: .horizontal)
-        engineButton.setContentHuggingPriority(.required, for: .horizontal)
-        engineButton.setContentCompressionResistancePriority(.required, for: .horizontal)
         translationButton.setContentHuggingPriority(.required, for: .horizontal)
         refineButton.setContentHuggingPriority(.required, for: .horizontal)
         refineButton.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -735,6 +761,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     @objc private func end() {
         NSLog("action: end (state=%@, entries=%d)", String(describing: state), entries.count)
+        switching = false
+        switchToken += 1
         starting = false
         running = false
         let oldCapture = capture
@@ -760,7 +788,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private var hasContent: Bool {
-        !entries.isEmpty || !liveJapanese.isEmpty
+        !entries.isEmpty || !liveText.isEmpty
     }
 
     private func pause() {
@@ -783,9 +811,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func resume() {
         NSLog("action: resume")
-        // Apple 模式只做逐字稿，翻譯與潤稿的設定不影響它
-        guard worker?.isRunning == true, sink != nil, usesAnalyzer != prefersParakeet, activeRefine == refineEnabled,
-              usesAnalyzer || (activeTranslation == (preferredTranslation ?? "") && activePolish == polishEnabled) else {
+        guard worker?.isRunning == true, sink != nil, activeRefine == refineEnabled, activePolish == polishEnabled,
+              activeTranslation == (preferredTranslation ?? ""), activeTarget == translationTarget else {
             start(fresh: false)
             return
         }
@@ -794,57 +821,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         beginCapture()
     }
 
-    private static let parakeetJapanese = "Models/parakeet-tdt_ctc-0.6b-ja"
-    private static let parakeetEnglish = "Models/parakeet-tdt-0.6b-v3"
-
-    private var engineChoiceURL: URL {
-        projectRoot().appendingPathComponent("Models/speech-engine.txt")
-    }
-
-    private var prefersParakeet: Bool {
-        guard #available(macOS 26.0, *) else { return true }
-        let choice = (try? String(contentsOf: engineChoiceURL, encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return choice == "parakeet"
-    }
-
-    private func updateEngineButton() {
-        let parakeet = prefersParakeet
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.55)
-        ]
-        engineButton.attributedTitle = NSAttributedString(string: parakeet ? "parakeet" : "Apple", attributes: attributes)
-        engineButton.toolTip = parakeet
-            ? "語音辨識：parakeet（日文、英文），點一下切換成 Apple SpeechAnalyzer"
-            : "語音辨識：Apple SpeechAnalyzer（日文、英文），點一下切換成 parakeet"
-        // Apple 模式只做逐字稿，不翻譯也不潤稿
-        polishButton?.isHidden = !parakeet
-        translationButton?.isHidden = !parakeet
-        updateRefineButton()
-    }
-
-    @objc private func switchEngine() {
-        let toParakeet = !prefersParakeet
-        NSLog("action: switch engine to %@", toParakeet ? "parakeet" : "SpeechAnalyzer")
-        if toParakeet {
-            let root = projectRoot()
-            let missing = [Self.parakeetJapanese, Self.parakeetEnglish].filter {
-                !FileManager.default.fileExists(atPath: root.appendingPathComponent($0).appendingPathComponent("model.safetensors").path)
-            }
-            guard missing.isEmpty else {
-                let alert = NSAlert()
-                alert.messageText = "尚未下載 parakeet 模型"
-                alert.informativeText = "缺少 \(missing.joined(separator: "、"))。請在專案目錄執行：\nLIVE_TRANSLATOR_PARAKEET=1 .venv/bin/python Scripts/download_models.py"
-                alert.runModal()
-                return
-            }
-            try? "parakeet\n".write(to: engineChoiceURL, atomically: true, encoding: .utf8)
-        } else {
-            try? FileManager.default.removeItem(at: engineChoiceURL)
-        }
-        updateEngineButton()
-        // 暫停、已終止、出錯時只記下選擇，下次開始時套用；正在聽時立刻換
+    // 設定改變時，正在聽就立刻重啟 worker；暫停、已終止、出錯時下次開始或繼續時套用
+    private func restartIfListening() {
+        // 切換中改的設定，等舊 worker 收完尾、新 worker 啟動時自然讀到
+        guard !switching else { return }
         switch state {
         case .preparing, .listening:
             restartEngine()
@@ -853,14 +833,53 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
+    // 比照 end() 優雅收尾：停止擷取 → 讓 SpeechEngine 把未定稿的句子定稿送出 → 關舊 worker 的 stdin 讓它 EOF，
+    // 舊 worker 的輸出 handler 繼續把剩下的定稿與譯文套到 entries → 舊程序結束後才用新設定啟動。
+    // 這段期間（收尾約數秒，加上新模型載入）不擷取系統音訊，也不錄音
     private func restartEngine() {
+        NSLog("action: switching worker (drain old)")
         starting = false
         running = false
+        switching = true
+        switchToken += 1
+        let token = switchToken
         let oldCapture = capture
         capture = nil
+        let oldEngine = engineBox
+        let oldSink = sink
+        sink = nil
+        let oldWorker = worker
+        // 舊 worker 的 handler 自己留著處理到 EOF；這裡只放開對它的引用，之後 start() 不會去動它
+        worker = nil
+        inputPipe = nil
+        outputPipe = nil
+        errorPipe = nil
+        endingWorker = false
+        recorder.pause()
+        setState(.preparing)
         Task { @MainActor in
             await oldCapture?.stop()
-            self.liveJapanese = ""
+            if #available(macOS 26.0, *), let engine = oldEngine as? SpeechEngine {
+                await engine.finish()
+            }
+            if self.engineBox === oldEngine { self.engineBox = nil }
+            oldSink?.close()
+            if let oldWorker {
+                // 收尾不應超過 60 秒；真的卡住就強制結束，entries 由 terminationHandler 補標定稿
+                DispatchQueue.main.asyncAfter(deadline: .now() + 60) {
+                    if oldWorker.isRunning { oldWorker.terminate() }
+                }
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    DispatchQueue.global().async {
+                        oldWorker.waitUntilExit()
+                        continuation.resume()
+                    }
+                }
+            }
+            // 切換期間按了終止或又換了設定：這次不啟動，交給最後一次
+            guard token == self.switchToken else { return }
+            self.switching = false
+            self.liveText = ""
             self.liveStable = ""
             self.start(fresh: false)
         }
@@ -876,7 +895,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         projectRoot().appendingPathComponent("Models/final-model.txt")
     }
 
-    // worker 啟動時讀 final-model.txt；內容為空或 none 視為關閉
+    // 啟動 worker 時讀 final-model.txt，開啟才傳 --refine；內容為空或 none 視為關閉
     private var refineEnabled: Bool {
         guard let value = try? String(contentsOf: refineChoiceURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
         return !value.isEmpty && value != "none"
@@ -889,7 +908,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             .foregroundColor: on ? NSColor(srgbRed: 1.0, green: 0.85, blue: 0.42, alpha: 1.0) : NSColor.white.withAlphaComponent(0.3)
         ]
         refineButton.attributedTitle = NSAttributedString(string: on ? "Qwen 重解：開" : "Qwen 重解：關", attributes: attributes)
-        let effect = prefersParakeet ? "較準但中文晚 1～2 秒" : "較準但定稿晚約 1 秒"
+        let effect = "較準但定稿晚約 1 秒"
         refineButton.toolTip = on
             ? "每句定稿後用 Qwen3-ASR 重新辨識，\(effect)、多佔 2.5 GB 記憶體。點一下關閉"
             : "點一下開啟：每句定稿後用 Qwen3-ASR 重新辨識，\(effect)、多佔 2.5 GB 記憶體"
@@ -903,23 +922,67 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             guard FileManager.default.fileExists(atPath: model.path) else {
                 let alert = NSAlert()
                 alert.messageText = "尚未下載 Qwen3-ASR 模型"
-                alert.informativeText = "缺少 Models/\(Self.refineModel)。下載方式見 Docs/SETUP.md 第 9 節「選用：定稿後用 Qwen3-ASR 重新辨識」。"
+                alert.informativeText = "缺少 Models/\(Self.refineModel)。下載方式見 Docs/SETUP.md 第 9 節「Qwen 重解（預設開啟）」。"
                 alert.runModal()
                 return
             }
-            // 和潤稿互斥：兩個一起開記憶體會超過 16 GB 機器能負荷的量
-            try? FileManager.default.removeItem(at: polishChoiceURL)
             try? "\(Self.refineModel)\n".write(to: refineChoiceURL, atomically: true, encoding: .utf8)
         }
         NSLog("action: refine %@", refineEnabled ? "on" : "off")
         updateRefineButton()
-        updatePolishButton()
-        switch state {
-        case .preparing, .listening:
-            restartEngine()
-        case .paused, .ended, .problem:
-            break
+        restartIfListening()
+    }
+
+    // 翻譯前潤稿（預設關閉）：設定檔用 prepolish-model.txt，polish-model.txt 是舊版的重解開關，migrateLegacySettings 會刪掉
+    private static let polishModel = "Qwen3-4B-4bit"
+
+    private var polishChoiceURL: URL {
+        projectRoot().appendingPathComponent("Models/prepolish-model.txt")
+    }
+
+    private var polishInstalled: Bool {
+        FileManager.default.fileExists(atPath: projectRoot().appendingPathComponent("Models/\(Self.polishModel)/config.json").path)
+    }
+
+    // 啟動 worker 時讀 prepolish-model.txt；缺檔、空、none 或模型目錄不存在都視為關閉
+    private var polishEnabled: Bool {
+        guard let value = try? String(contentsOf: polishChoiceURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
+        return !value.isEmpty && value != "none" && polishInstalled
+    }
+
+    private func updatePolishButton() {
+        let on = polishEnabled
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
+            .foregroundColor: on ? NSColor(srgbRed: 1.0, green: 0.85, blue: 0.42, alpha: 1.0) : NSColor.white.withAlphaComponent(0.3)
+        ]
+        let failed = on && polishFailed
+        polishButton.attributedTitle = NSAttributedString(string: failed ? "潤稿：載入失敗" : on ? "潤稿：開" : "潤稿：關", attributes: attributes)
+        let effect = "翻譯前先用 Qwen3-4B 刪贅詞、補標點、修正聽錯的術語（不翻譯、不改意思），譯文晚約 2 秒、多佔約 2.4 GB 記憶體"
+        var tip = on ? "\(effect)。點一下關閉" : "點一下開啟：\(effect)"
+        if failed, !polishNotice.isEmpty { tip += "\n\(polishNotice)" }
+        polishButton.toolTip = tip
+    }
+
+    @objc private func togglePolish() {
+        if polishEnabled {
+            try? FileManager.default.removeItem(at: polishChoiceURL)
+        } else {
+            guard polishInstalled else {
+                let alert = NSAlert()
+                alert.messageText = "尚未下載潤稿模型"
+                alert.informativeText = "缺少 Models/\(Self.polishModel)。下載方式見 Docs/SETUP.md 第 9 節「翻譯前潤稿（選用，預設關閉）」。"
+                alert.runModal()
+                return
+            }
+            try? "\(Self.polishModel)\n".write(to: polishChoiceURL, atomically: true, encoding: .utf8)
         }
+        NSLog("action: polish %@", polishEnabled ? "on" : "off")
+        // 設定一改，之前的載入失敗就作廢（下次開始聆聽才會重新載入）
+        polishFailed = false
+        polishNotice = ""
+        updatePolishButton()
+        restartIfListening()
     }
 
     // Models/glossary.txt 的正確寫法（「聽錯=正確」取等號右邊，單獨一行的整行採用），worker 讀同一個檔做替換與翻譯提示
@@ -936,108 +999,93 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         return terms
     }
 
-    private static let polishModel = "Qwen3-4B-4bit"
-
-    private var polishChoiceURL: URL {
-        projectRoot().appendingPathComponent("Models/polish-model.txt")
-    }
-
-    // worker 啟動時讀 polish-model.txt；內容為空或 none 視為關閉
-    private var polishEnabled: Bool {
-        guard let value = try? String(contentsOf: polishChoiceURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines) else { return false }
-        return !value.isEmpty && value != "none"
-    }
-
-    private func updatePolishButton() {
-        let on = polishEnabled
-        let attributes: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: on ? NSColor(srgbRed: 1.0, green: 0.85, blue: 0.42, alpha: 1.0) : NSColor.white.withAlphaComponent(0.3)
-        ]
-        polishButton.attributedTitle = NSAttributedString(string: on ? "潤稿：開" : "潤稿：關", attributes: attributes)
-        polishButton.toolTip = on
-            ? "用 Qwen3-4B 學會議中的專有名詞與主題給翻譯參考，並在空檔替原文刪贅詞、補標點；多佔 2.1 GB 記憶體。點一下關閉"
-            : "點一下開啟：用 Qwen3-4B 學會議中的專有名詞與主題給翻譯參考，並在空檔替原文刪贅詞、補標點；多佔 2.1 GB 記憶體"
-    }
-
-    @objc private func togglePolish() {
-        if polishEnabled {
-            try? FileManager.default.removeItem(at: polishChoiceURL)
-        } else {
-            let model = projectRoot().appendingPathComponent("Models/\(Self.polishModel)")
-            guard FileManager.default.fileExists(atPath: model.path) else {
-                let alert = NSAlert()
-                alert.messageText = "尚未下載 Qwen3-4B 模型"
-                alert.informativeText = "缺少 Models/\(Self.polishModel)。下載方式見 Docs/SETUP.md 第 9 節「選用：定稿後先潤稿再翻譯」。"
-                alert.runModal()
-                return
-            }
-            // 和 Qwen 重解互斥：兩個一起開記憶體會超過 16 GB 機器能負荷的量
-            try? FileManager.default.removeItem(at: refineChoiceURL)
-            try? "\(Self.polishModel)\n".write(to: polishChoiceURL, atomically: true, encoding: .utf8)
-        }
-        NSLog("action: polish %@", polishEnabled ? "on" : "off")
-        updatePolishButton()
-        updateRefineButton()
-        // 潤稿在 worker 裡，兩種辨識引擎都適用：正在聽時立刻重啟，其他狀態下次開始時套用
-        switch state {
-        case .preparing, .listening:
-            restartEngine()
-        case .paused, .ended, .problem:
-            break
-        }
-    }
-
-    // 已知的翻譯模型，依優先順序；選單只列出已下載的
+    // 已知的 PLaMo 翻譯模型，依優先順序；選單只列出已下載的
     private static let translationModels: [(name: String, label: String, detail: String)] = [
-        ("Hy-MT2-1.8B-8bit", "Hy-MT2 1.8B", "預設，快，譯文忠實簡潔"),
-        ("Hy-MT2-7B-4bit", "Hy-MT2 7B", "較準，每句多約 2 秒、多佔 2.1 GB 記憶體"),
-        ("Qwen3-4B-4bit", "Qwen3 4B", "通用聊天模型")
+        ("plamo-3-translate-2b-MLX-4bit", "PLaMo 2B", "預設，快"),
+        ("plamo-3-translate-8b-MLX-4bit", "PLaMo 8B", "較準，多約 3.7 GB 記憶體、較慢")
+    ]
+
+    private static let translationTargets: [(value: String, label: String)] = [
+        ("zh-hant", "繁體中文"),
+        ("ja-en", "日英互譯")
     ]
 
     private var translationChoiceURL: URL {
         projectRoot().appendingPathComponent("Models/translation-model.txt")
     }
 
+    private var translationTargetURL: URL {
+        projectRoot().appendingPathComponent("Models/translation-target.txt")
+    }
+
     private func translationInstalled(_ name: String) -> Bool {
-        FileManager.default.fileExists(atPath: projectRoot().appendingPathComponent("Models/\(name)/model.safetensors").path)
+        FileManager.default.fileExists(atPath: projectRoot().appendingPathComponent("Models/\(name)/config.json").path)
     }
 
     private var installedTranslations: [String] {
         var names = Self.translationModels.map(\.name)
         if let chosen = try? String(contentsOf: translationChoiceURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-           !chosen.isEmpty, !names.contains(chosen) {
+           chosen.hasPrefix("plamo"), !names.contains(chosen) {
             names.append(chosen)
         }
         return names.filter(translationInstalled)
     }
 
-    // translation-model.txt 指定且已下載就用它，否則用清單裡第一個已下載的
+    // translation-model.txt 指定了 plamo 開頭且已下載的就用它（舊的 Hy-MT2 設定直接忽略），否則用第一個已下載的
     private var preferredTranslation: String? {
         if let chosen = try? String(contentsOf: translationChoiceURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
-           !chosen.isEmpty, translationInstalled(chosen) {
+           chosen.hasPrefix("plamo"), translationInstalled(chosen) {
             return chosen
         }
         return installedTranslations.first
+    }
+
+    // translation-target.txt：zh-hant 或 ja-en；缺檔或不認得都當 zh-hant
+    private var translationTarget: String {
+        let value = (try? String(contentsOf: translationTargetURL, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return Self.translationTargets.contains { $0.value == value } ? value : "zh-hant"
     }
 
     private func translationLabel(_ name: String) -> String {
         Self.translationModels.first { $0.name == name }?.label ?? name
     }
 
+    private func targetLabel(_ value: String) -> String {
+        Self.translationTargets.first { $0.value == value }?.label ?? value
+    }
+
     private func updateTranslationButton() {
-        let name = preferredTranslation ?? "未安裝"
+        let model = preferredTranslation
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 12, weight: .medium),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.55)
+            .foregroundColor: NSColor.white.withAlphaComponent(model == nil ? 0.3 : 0.55)
         ]
-        translationButton.attributedTitle = NSAttributedString(string: translationLabel(name), attributes: attributes)
-        translationButton.toolTip = "翻譯模型：\(name)，點一下切換"
+        let status = model == nil ? "未安裝" : translatorFailed ? "載入失敗" : targetLabel(translationTarget)
+        translationButton.attributedTitle = NSAttributedString(string: "譯文：\(status)", attributes: attributes)
+        var tip = model.map { "翻譯模型：\(translationLabel($0))，點一下切換譯文與模型" } ?? "尚未下載 PLaMo 翻譯模型，只有逐字稿。下載方式見 Docs/SETUP.md"
+        if !workerNotice.isEmpty { tip += "\n\(workerNotice)" }
+        if !translateNotice.isEmpty { tip += "\n\(translateNotice)" }
+        translationButton.toolTip = tip
     }
 
     @objc private func showTranslationMenu() {
         let menu = NSMenu()
+        menu.addItem(NSMenuItem.sectionHeader(title: "譯文"))
+        for target in Self.translationTargets {
+            let item = NSMenuItem(title: target.label, action: #selector(chooseTarget(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = target.value
+            item.state = target.value == translationTarget ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
+        menu.addItem(NSMenuItem.sectionHeader(title: "翻譯模型"))
         let current = preferredTranslation
+        if installedTranslations.isEmpty {
+            let item = NSMenuItem(title: "尚未下載（見 Docs/SETUP.md）", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
         for name in installedTranslations {
             let detail = Self.translationModels.first { $0.name == name }?.detail
             let item = NSMenuItem(title: detail.map { "\(translationLabel(name))　\($0)" } ?? name, action: #selector(chooseTranslation(_:)), keyEquivalent: "")
@@ -1053,18 +1101,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         panel.level = level
     }
 
+    @objc private func chooseTarget(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? String, value != translationTarget else { return }
+        NSLog("action: switch translation target to %@", value)
+        try? "\(value)\n".write(to: translationTargetURL, atomically: true, encoding: .utf8)
+        updateTranslationButton()
+        restartIfListening()
+    }
+
     @objc private func chooseTranslation(_ sender: NSMenuItem) {
         guard let name = sender.representedObject as? String, name != preferredTranslation else { return }
-        NSLog("action: switch translation to %@", name)
+        NSLog("action: switch translation model to %@", name)
         try? "\(name)\n".write(to: translationChoiceURL, atomically: true, encoding: .utf8)
         updateTranslationButton()
-        // 與切換辨識引擎相同：正在聽時立刻重啟，其他狀態下次開始時套用
-        switch state {
-        case .preparing, .listening:
-            restartEngine()
-        case .paused, .ended, .problem:
-            break
-        }
+        restartIfListening()
     }
 
     // 一開始就建立 Transcripts/<名稱>/ 資料夾，裡面放同名的逐字稿與錄音檔，之後邊聽邊寫入
@@ -1230,7 +1280,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         case .preparing:
             spinner.startAnimation(nil)
             setDot(nil, pulse: false)
-            statusLabel.stringValue = "準備中…"
+            statusLabel.stringValue = switching ? "切換中…" : "準備中…"
             statusLabel.toolTip = nil
             setSymbol(toggleButton, "pause.fill", tip: "暫停")
         case .listening:
@@ -1267,13 +1317,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func transcriptLines(includeLive: Bool) -> [String] {
         var lines: [String] = []
         for entry in entries {
-            lines.append("[\(entry.time)] \(entry.japanese)")
-            if let chinese = entry.chinese, !chinese.isEmpty {
-                lines.append("           \(chinese)")
+            lines.append("[\(entry.time)] \(entry.text)")
+            if let translation = entry.translation, !translation.isEmpty {
+                lines.append("           \(translation)")
             }
         }
-        if includeLive && !liveJapanese.isEmpty {
-            lines.append("[\(clock.string(from: Date()))] \(liveJapanese)（未定稿）")
+        if includeLive && !liveText.isEmpty {
+            lines.append("[\(clock.string(from: Date()))] \(liveText)（未定稿）")
         }
         return lines
     }
@@ -1282,8 +1332,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         entries.removeAll()
         committedCount = 0
         committedLength = 0
-        currentUtterance = 0
-        liveJapanese = ""
+        liveText = ""
         liveStable = ""
         transcriptView.textStorage?.setAttributedString(NSAttributedString())
         emptyLabel?.isHidden = false
@@ -1305,22 +1354,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         storage.beginEditing()
         storage.deleteCharacters(in: NSRange(location: committedLength, length: storage.length - committedLength))
         for entry in entries[committedCount...] {
-            if let chinese = entry.chinese, !chinese.isEmpty {
-                storage.append(NSAttributedString(string: entry.japanese + "\n", attributes: japaneseAttributes))
-                storage.append(NSAttributedString(string: chinese + "\n", attributes: chineseAttributes))
+            if let translation = entry.translation, !translation.isEmpty {
+                storage.append(NSAttributedString(string: entry.text + "\n", attributes: textAttributes))
+                storage.append(NSAttributedString(string: translation + "\n", attributes: translationAttributes))
             } else {
-                storage.append(NSAttributedString(string: entry.japanese + "\n", attributes: japaneseAloneAttributes))
+                storage.append(NSAttributedString(string: entry.text + "\n", attributes: textAloneAttributes))
             }
         }
-        if !liveJapanese.isEmpty {
-            let stable = liveJapanese.hasPrefix(liveStable) ? liveStable : ""
+        if !liveText.isEmpty {
+            let stable = liveText.hasPrefix(liveStable) ? liveStable : ""
             storage.append(NSAttributedString(string: stable, attributes: liveAttributes))
-            storage.append(NSAttributedString(string: String(liveJapanese.dropFirst(stable.count)) + "\n", attributes: tentativeAttributes))
+            storage.append(NSAttributedString(string: String(liveText.dropFirst(stable.count)) + "\n", attributes: tentativeAttributes))
         }
         storage.endEditing()
         emptyLabel.isHidden = storage.length > 0
-        while committedCount < entries.count, let chinese = entries[committedCount].chinese {
-            committedLength += (entries[committedCount].japanese as NSString).length + 1 + (chinese.isEmpty ? 0 : (chinese as NSString).length + 1)
+        while committedCount < entries.count, entries[committedCount].finalized {
+            committedLength += renderedLength(entries[committedCount])
             committedCount += 1
         }
         if wasAtBottom {
@@ -1341,8 +1390,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         outputPipe = nil
         errorPipe = nil
         endingWorker = false
+        switching = false
+        workerGeneration += 1
+        let generation = workerGeneration
         starting = true
-        currentUtterance = 0
         if fresh {
             closeSession()
             resetTranscript()
@@ -1351,22 +1402,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         setState(.preparing)
 
         let root = projectRoot()
-        usesAnalyzer = !prefersParakeet
         activeRefine = refineEnabled
         activePolish = polishEnabled
         utteranceBase = entries.map(\.utterance).max() ?? 0
-        updateEngineButton()
-        NSLog("speech engine: %@", usesAnalyzer ? "SpeechAnalyzer" : "parakeet")
+        workerNotice = ""
+        translateNotice = ""
+        translatorFailed = false
+        polishFailed = false
+        polishNotice = ""
+        updatePolishButton()
         let python = root.appendingPathComponent(".venv/bin/python")
         let script = Bundle.main.resourceURL!.appendingPathComponent("worker.py")
-        let speech = root.appendingPathComponent(Self.parakeetJapanese)
         activeTranslation = preferredTranslation ?? ""
+        activeTarget = translationTarget
         updateTranslationButton()
-        let translation = preferredTranslation.map { root.appendingPathComponent("Models/\($0)") }
         guard FileManager.default.isExecutableFile(atPath: python.path),
-              FileManager.default.fileExists(atPath: script.path),
-              usesAnalyzer || FileManager.default.fileExists(atPath: speech.appendingPathComponent("model.safetensors").path),
-              usesAnalyzer || translation != nil else {
+              FileManager.default.fileExists(atPath: script.path) else {
             starting = false
             setState(.problem("尚未完成安裝", "請先在專案目錄執行 Scripts/setup.sh"))
             return
@@ -1374,17 +1425,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
         let process = Process()
         process.executableURL = python
-        let english = root.appendingPathComponent(Self.parakeetEnglish)
-        var arguments: [String]
-        if usesAnalyzer {
-            // Apple 模式只做逐字稿：worker 不載入翻譯模型，Qwen 重解開著時才帶模型路徑
-            arguments = [script.path, "--transcribe", root.appendingPathComponent("Models").path]
-            if activeRefine { arguments.append(root.appendingPathComponent("Models/\(Self.refineModel)").path) }
-        } else {
-            arguments = [script.path, speech.path, translation!.path]
-            if FileManager.default.fileExists(atPath: english.appendingPathComponent("model.safetensors").path) {
-                arguments.append(english.path)
-            }
+        // worker 只做逐字稿；Qwen 重解、翻譯前潤稿與翻譯各自開著時才帶模型路徑，可同時開
+        var arguments = [script.path, "--transcribe", root.appendingPathComponent("Models").path]
+        if activeRefine { arguments += ["--refine", root.appendingPathComponent("Models/\(Self.refineModel)").path] }
+        // 潤稿開著且模型已下載才帶 --polish
+        if activePolish { arguments += ["--polish", root.appendingPathComponent("Models/\(Self.polishModel)").path] }
+        if let model = preferredTranslation {
+            arguments += ["--translate", root.appendingPathComponent("Models/\(model)").path, "--target", activeTarget]
         }
         process.arguments = arguments
         process.environment = ProcessInfo.processInfo.environment.merging([
@@ -1403,15 +1450,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         sink = AudioSink(input.fileHandleForWriting)
         outputPipe = output
         errorPipe = errors
-        pendingOutput.removeAll()
         workerError = ""
+        let buffer = OutputBuffer()
 
-        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        // handler 直接用 output / errors：切換時 Pipe 要活到 worker 收完尾（EOF 時 handler 清掉，引用才放開）
+        output.fileHandleForReading.readabilityHandler = { [weak self] _ in
+            let handle = output.fileHandleForReading
             let data = handle.availableData
             guard !data.isEmpty else { handle.readabilityHandler = nil; return }
-            DispatchQueue.main.async { self?.receive(data) }
+            DispatchQueue.main.async { self?.receive(data, buffer: buffer, process: process) }
         }
-        errors.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        errors.fileHandleForReading.readabilityHandler = { [weak self] _ in
+            let handle = errors.fileHandleForReading
             let data = handle.availableData
             guard !data.isEmpty else { handle.readabilityHandler = nil; return }
             guard let value = String(data: data, encoding: .utf8), !value.isEmpty else { return }
@@ -1423,7 +1473,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
         process.terminationHandler = { [weak self] process in
             DispatchQueue.main.async {
-                guard let self, self.worker === process else { return }
+                guard let self else { return }
+                // 不論怎麼結束，它還沒送回定稿的句子都不會再有了；標成已定稿，commit 才不會卡住
+                self.finalizeOrphans(generation: generation)
+                guard self.worker === process else { return }
                 self.worker = nil
                 if self.endingWorker {
                     self.endingWorker = false
@@ -1445,58 +1498,65 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
-    private func receive(_ data: Data) {
-        pendingOutput.append(data)
-        while let newline = pendingOutput.firstIndex(of: 10) {
-            let line = pendingOutput.prefix(upTo: newline)
-            pendingOutput.removeSubrange(...newline)
+    // process 不是目前的 worker 時（切換中舊 worker 在收尾）：只套用 final 與譯文，不碰狀態與提示
+    private func receive(_ data: Data, buffer: OutputBuffer, process: Process) {
+        let active = worker === process
+        buffer.data.append(data)
+        while let newline = buffer.data.firstIndex(of: 10) {
+            let line = buffer.data.prefix(upTo: newline)
+            buffer.data.removeSubrange(...newline)
             guard let event = try? JSONDecoder().decode(WorkerEvent.self, from: line) else { continue }
-            // parakeet 的 worker 每次啟動都從 1 編號；SpeechAnalyzer 模式送出時已加過 utteranceBase
-            let utterance = usesAnalyzer ? event.utterance : utteranceBase + event.utterance
+            let utterance = event.utterance
             switch event.kind {
             case "status":
                 break
             case "ready":
-                if usesAnalyzer, #available(macOS 26.0, *) {
+                guard active else { break }
+                if #available(macOS 26.0, *) {
                     prepareAnalyzer()
-                } else {
-                    beginCapture()
-                }
-            case "partial_japanese":
-                guard utterance >= currentUtterance else { break }
-                currentUtterance = utterance
-                liveJapanese = event.japanese
-                liveStable = event.stable ?? ""
-                renderTranscript()
-                if running { setState(.listening) }
-            case "final_japanese":
-                entries.append(TranscriptEntry(utterance: utterance, time: clock.string(from: Date()), japanese: event.japanese, chinese: nil))
-                if utterance >= currentUtterance {
-                    currentUtterance = utterance + 1
-                    liveJapanese = ""
-                    liveStable = ""
-                }
-                renderTranscript()
-                refreshSavedFile()
-            case "revised_japanese":
-                if let index = entries.lastIndex(where: { $0.utterance == utterance }) {
-                    invalidateRendering(from: index)
-                    entries[index].japanese = event.japanese
-                    renderTranscript()
-                    refreshSavedFile()
                 }
             case "final":
                 if let index = entries.lastIndex(where: { $0.utterance == utterance }) {
                     invalidateRendering(from: index)
-                    entries[index].japanese = event.japanese
-                    entries[index].chinese = event.chinese
+                    if event.translation.isEmpty {
+                        // 逐字稿定稿事件不帶譯文：文字沒變就保留已有的譯文，變了才清掉（修正後會重新翻譯）
+                        if entries[index].text != event.text { entries[index].translation = nil }
+                        entries[index].text = event.text
+                    } else if entries[index].text == event.text {
+                        entries[index].translation = event.translation
+                    }
+                    // 文字對不上的譯文是修正前那句的，丟掉
+                    entries[index].finalized = true
                 } else {
-                    entries.append(TranscriptEntry(utterance: utterance, time: clock.string(from: Date()), japanese: event.japanese, chinese: event.chinese))
+                    entries.append(TranscriptEntry(utterance: utterance, time: clock.string(from: Date()), text: event.text, translation: event.translation.isEmpty ? nil : event.translation, finalized: true, generation: workerGeneration))
+                }
+                // 這句翻成功了，之前單句失敗的提示就不用留著
+                if active, !event.translation.isEmpty, !translateNotice.isEmpty {
+                    translateNotice = ""
+                    updateTranslationButton()
                 }
                 renderTranscript()
                 refreshSavedFile()
                 if running { setState(.listening) }
+            case "warning":
+                NSLog("worker warning: %@", event.message)
+                guard active else { break }
+                switch event.code {
+                case "translator_load":
+                    translatorFailed = true
+                    workerNotice = event.message
+                case "polish_load":
+                    polishFailed = true
+                    polishNotice = event.message
+                case "translate_failed", "finalize_failed":
+                    translateNotice = event.message
+                default:
+                    workerNotice = event.message
+                }
+                updateTranslationButton()
+                updatePolishButton()
             case "error":
+                guard active else { break }
                 setState(.problem("處理時發生錯誤", event.message))
             default:
                 break
@@ -1504,11 +1564,31 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
+    // 畫面上 entry 佔的字元數（含換行）；renderTranscript 的 commit 迴圈與 invalidateRendering 共用同一個公式
+    private func renderedLength(_ entry: TranscriptEntry) -> Int {
+        let translation = entry.translation ?? ""
+        return (entry.text as NSString).length + 1 + (translation.isEmpty ? 0 : (translation as NSString).length + 1)
+    }
+
+    // index 之前的句子畫面不變，只退回到 index；renderTranscript 會把 storage 從 committedLength 之後截掉重畫
     private func invalidateRendering(from index: Int) {
         if index < committedCount {
-            committedCount = 0
-            committedLength = 0
+            committedCount = index
+            committedLength = entries[..<index].reduce(0) { $0 + renderedLength($1) }
         }
+    }
+
+    // worker 結束後（正常收尾、被終止或當掉），該 worker 還沒送回定稿的句子不會再有了
+    private func finalizeOrphans(generation: Int) {
+        var changed = false
+        for index in entries.indices where entries[index].generation == generation && !entries[index].finalized {
+            entries[index].finalized = true
+            changed = true
+        }
+        guard changed else { return }
+        NSLog("worker ended with unfinalized entries (generation %d), marked finalized", generation)
+        renderTranscript()
+        refreshSavedFile()
     }
 
     private func cancelEngine() {
@@ -1527,8 +1607,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         NSLog("glossary: %d contextual strings", engine.contextualStrings.count)
         utteranceBase = entries.map(\.utterance).max() ?? 0
         engine.onPartial = { [weak self] text in self?.analyzerPartial(text) }
-        engine.onFinal = { [weak self] id, text, language, start, end in
-            self?.analyzerFinal(id: id, text: text, language: language, start: start, end: end, sink: sink)
+        engine.onFinal = { [weak self, weak engine] id, text, language, start, end in
+            self?.analyzerFinal(id: id, text: text, language: language, start: start, end: end, sink: sink, engine: engine)
         }
         engine.onRevise = { [weak self] id, text in self?.analyzerRevise(id: id, text: text, sink: sink) }
         engine.onError = { [weak self] message in
@@ -1550,8 +1630,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func analyzerPartial(_ text: String) {
-        liveStable = String(zip(liveJapanese, text).prefix { $0 == $1 }.map(\.0))
-        liveJapanese = text
+        liveStable = String(zip(liveText, text).prefix { $0 == $1 }.map(\.0))
+        liveText = text
         renderTranscript()
         if running { setState(.listening) }
     }
@@ -1570,35 +1650,38 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private static let refineLeadSeconds = 0.1
     private static let refineTailSeconds = 0.1
 
-    private func analyzerFinal(id: Int, text: String, language: String, start: Double, end: Double, sink: AudioSink) {
+    @available(macOS 26.0, *)
+    private func analyzerFinal(id: Int, text: String, language: String, start: Double, end: Double, sink: AudioSink, engine: SpeechEngine?) {
         let utterance = utteranceBase + id
-        entries.append(TranscriptEntry(utterance: utterance, time: clock.string(from: Date()), japanese: text, chinese: nil))
+        entries.append(TranscriptEntry(utterance: utterance, time: clock.string(from: Date()), text: text, language: language, generation: workerGeneration))
         renderTranscript()
         refreshSavedFile()
         var audio: Data?
-        if #available(macOS 26.0, *), activeRefine, let engine = engineBox as? SpeechEngine {
+        // 用傳進來的 engine 而不是 engineBox：收尾時 engineBox 已清掉，最後幾句才拿得到音訊
+        if activeRefine, let engine {
             audio = engine.feeder.audio(from: start - Self.refineLeadSeconds, to: end + Self.refineTailSeconds)
         }
         sendToWorker(utterance: utterance, text: text, language: language, audio: audio, sink: sink)
     }
 
-    // SpeechAnalyzer 事後修正已送出的句子。Qwen 重解開著時以重解結果為準：已定稿就不動，未定稿只更新畫面
+    // SpeechAnalyzer 事後修正已送出的句子。Qwen 重解開著時以重解結果為準：已定稿就不動，未定稿只更新畫面。
+    // 重解沒開時改完重送 worker，worker 會重新刪贅詞並重新翻譯
     private func analyzerRevise(id: Int, text: String, sink: AudioSink) {
         let utterance = utteranceBase + id
         guard let index = entries.lastIndex(where: { $0.utterance == utterance }) else { return }
-        if activeRefine && entries[index].chinese != nil { return }
+        if activeRefine && entries[index].finalized { return }
         invalidateRendering(from: index)
-        entries[index].japanese = text
+        entries[index].text = text
         renderTranscript()
         refreshSavedFile()
-        if !activeRefine { sendToWorker(utterance: utterance, text: text, sink: sink) }
+        if !activeRefine { sendToWorker(utterance: utterance, text: text, language: entries[index].language, sink: sink) }
     }
 
     private func beginCapture() {
-        guard starting, let sink else { return }
+        guard starting, sink != nil else { return }
         let recorder = recorder
-        var onAudio: (Data) -> Void = { data in sink.write(data); recorder.append(data) }
-        if #available(macOS 26.0, *), usesAnalyzer, let engine = engineBox as? SpeechEngine {
+        var onAudio: (Data) -> Void = { data in recorder.append(data) }
+        if #available(macOS 26.0, *), let engine = engineBox as? SpeechEngine {
             let feeder = engine.feeder
             onAudio = { data in feeder.append(data); recorder.append(data) }
         }
