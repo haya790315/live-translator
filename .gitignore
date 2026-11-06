@@ -28,7 +28,6 @@ Models/*
 *.bin
 *.gguf
 *.safetensors
-*.onnx
 *.mlmodelc/
 
 # Audio, transcripts, and benchmark output
